@@ -4,11 +4,14 @@ const rideController = require('../controllers/rideController');
 const { protect, restrictUserType } = require('../middleware/authMiddleware');
 const { validate, rideValidations } = require('../middleware/validationMiddleware');
 
-// Debug: Check if controller functions exist
-console.log('rideController functions:', Object.keys(rideController));
 
 // All routes require authentication
 router.use(protect);
+router.post('/estimate', 
+  restrictUserType('user'),
+  validate(rideValidations.estimate),
+  rideController.estimateRide
+);
 
 // User routes
 router.get('/user/history', 

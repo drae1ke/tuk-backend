@@ -4,6 +4,45 @@ const Driver = require('../models/Driver');
 const { getDirections, calculateFare } = require('../config/ors');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
+// Estimate fare before requesting a ride
+exports.estimateRide = catchAsync(async (req, res, next) => {
+  const { pickup, destination, vehicleType } = req.body;
+
+  try {
+    const start = [pickup.longitude, pickup.latitude];
+    const end = [destination.longitude, destination.latitude];
+
+    const route = await getDirections(start, end);
+    const distance = route.distance / 1000;
+    const duration = route.duration / 60;
+    const fare = calculateFare(distance);
+
+    res.status(200).json({
+      status: 'success',
+      data: {
+        estimate: {
+          fare,
+          distance,
+          duration,
+          currency: 'KES',
+          vehicleType: vehicleType || 'standard',
+          pickup: {
+            latitude: pickup.latitude,
+            longitude: pickup.longitude,
+            address: pickup.address || 'Pickup Location'
+          },
+          destination: {
+            latitude: destination.latitude,
+            longitude: destination.longitude,
+            address: destination.address || 'Destination'
+          }
+        }
+      }
+    });
+  } catch (error) {
+    return next(new AppError(`Failed to estimate ride: ${error.message}`, 500));
+  }
+});
 
 // Request a ride
 exports.requestRide = catchAsync(async (req, res, next) => {
@@ -44,11 +83,15 @@ exports.requestRide = catchAsync(async (req, res, next) => {
     res.status(201).json({
       status: 'success',
       data: {
-        rideId: ride._id,
-        fare: ride.fare,
-        distance: ride.distance,
-        duration: ride.duration,
-        status: ride.status
+        ride: {
+          id: ride._id,
+          fare: ride.fare,
+          distance: ride.distance,
+          duration: ride.duration,
+          status: ride.status,
+          vehicleType: ride.vehicleType,
+          paymentMethod: ride.paymentMethod
+        }
       }
     });
   } catch (error) {

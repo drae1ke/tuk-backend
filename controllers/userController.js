@@ -1,5 +1,6 @@
 const User = require('../models/User');
 const Ride = require('../models/Ride');
+const Driver = require('../models/Driver');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
 const { reverseGeocode } = require('../config/ors');

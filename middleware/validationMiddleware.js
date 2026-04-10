@@ -1,4 +1,5 @@
 const { body, validationResult } = require('express-validator');
+const { isValidKenyanPhone } = require('../utils/phone');
 
 const validate = (validations) => {
   return async (req, res, next) => {
@@ -22,7 +23,9 @@ const userValidations = {
   register: [
     body('name').notEmpty().withMessage('Name is required').isLength({ min: 2, max: 50 }),
     body('email').isEmail().withMessage('Please provide a valid email'),
-    body('phone').matches(/^[0-9]{10}$/).withMessage('Please provide a valid 10-digit phone number'),
+    body('phone')
+      .custom((value) => isValidKenyanPhone(value))
+      .withMessage('Please provide a valid Kenyan phone number'),
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
   ],
   login: [
@@ -31,7 +34,10 @@ const userValidations = {
   ],
   updateProfile: [
     body('name').optional().isLength({ min: 2, max: 50 }),
-    body('phone').optional().matches(/^[0-9]{10}$/),
+    body('phone')
+      .optional()
+      .custom((value) => isValidKenyanPhone(value))
+      .withMessage('Please provide a valid Kenyan phone number'),
     body('email').optional().isEmail()
   ]
 };
@@ -41,7 +47,9 @@ const driverValidations = {
   register: [
     body('name').notEmpty(),
     body('email').isEmail(),
-    body('phone').matches(/^[0-9]{10}$/),
+    body('phone')
+      .custom((value) => isValidKenyanPhone(value))
+      .withMessage('Please provide a valid Kenyan phone number'),
     body('password').isLength({ min: 6 }),
     body('idNumber').notEmpty(),
     body('licenseNumber').notEmpty(),
@@ -58,6 +66,15 @@ const driverValidations = {
 
 // Ride validations
 const rideValidations = {
+  estimate: [
+    body('pickup.latitude').isFloat({ min: -90, max: 90 }),
+    body('pickup.longitude').isFloat({ min: -180, max: 180 }),
+    body('pickup.address').optional(),
+    body('destination.latitude').isFloat({ min: -90, max: 90 }),
+    body('destination.longitude').isFloat({ min: -180, max: 180 }),
+    body('destination.address').optional(),
+    body('vehicleType').optional().isIn(['standard', 'premium', 'shared'])
+  ],
   request: [
     body('pickup.latitude').isFloat({ min: -90, max: 90 }),
     body('pickup.longitude').isFloat({ min: -180, max: 180 }),

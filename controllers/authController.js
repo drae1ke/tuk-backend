@@ -5,6 +5,7 @@ const Driver = require('../models/Driver');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../utils/emailService');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
+const { normalizeKenyanPhone } = require('../utils/phone');
 
 // Generate JWT Token
 const signToken = (id, userType) => {
@@ -35,9 +36,11 @@ const createSendToken = (user, statusCode, res, userType = 'user') => {
 // Register new user
 exports.register = catchAsync(async (req, res, next) => {
   const { name, email, phone, password } = req.body;
+  const normalizedPhone = normalizeKenyanPhone(phone);
+  const normalizedEmail = email.toLowerCase();
   
   // Check if user exists
-  const existingUser = await User.findOne({ $or: [{ email }, { phone }] });
+  const existingUser = await User.findOne({ $or: [{ email: normalizedEmail }, { phone: normalizedPhone }] });
   if (existingUser) {
     return next(new AppError('User already exists with this email or phone', 400));
   }
@@ -48,8 +51,8 @@ exports.register = catchAsync(async (req, res, next) => {
   // Create user
   const user = await User.create({
     name,
-    email,
-    phone,
+    email: normalizedEmail,
+    phone: normalizedPhone,
     password,
     emailVerificationToken,
     emailVerified: false
@@ -64,9 +67,10 @@ exports.register = catchAsync(async (req, res, next) => {
 // Login user
 exports.login = catchAsync(async (req, res, next) => {
   const { email, password } = req.body;
+  const normalizedEmail = email.toLowerCase();
   
   // Check if user exists
-  const user = await User.findOne({ email }).select('+password');
+  const user = await User.findOne({ email: normalizedEmail }).select('+password');
   if (!user || !(await user.comparePassword(password))) {
     return next(new AppError('Invalid email or password', 401));
   }
@@ -83,9 +87,11 @@ exports.registerDriver = catchAsync(async (req, res, next) => {
     name, email, phone, password, idNumber, licenseNumber,
     vehicle: { make, model, year, color, plateNumber, type, capacity }
   } = req.body;
+  const normalizedPhone = normalizeKenyanPhone(phone);
+  const normalizedEmail = email.toLowerCase();
   
   // Check if driver exists
-  const existingDriver = await Driver.findOne({ $or: [{ email }, { phone }, { idNumber }, { licenseNumber }, { 'vehicle.plateNumber': plateNumber }] });
+  const existingDriver = await Driver.findOne({ $or: [{ email: normalizedEmail }, { phone: normalizedPhone }, { idNumber }, { licenseNumber }, { 'vehicle.plateNumber': plateNumber }] });
   if (existingDriver) {
     return next(new AppError('Driver already registered with this information', 400));
   }
@@ -93,8 +99,8 @@ exports.registerDriver = catchAsync(async (req, res, next) => {
   // Create driver (pending approval)
   const driver = await Driver.create({
     name,
-    email,
-    phone,
+    email: normalizedEmail,
+    phone: normalizedPhone,
     password,
     idNumber,
     licenseNumber,
@@ -113,8 +119,9 @@ exports.registerDriver = catchAsync(async (req, res, next) => {
 // Driver login
 exports.driverLogin = catchAsync(async (req, res, next) => {
   const { email, password } = req.body;
+  const normalizedEmail = email.toLowerCase();
   
-  const driver = await Driver.findOne({ email }).select('+password');
+  const driver = await Driver.findOne({ email: normalizedEmail }).select('+password');
   if (!driver || !(await driver.comparePassword(password))) {
     return next(new AppError('Invalid email or password', 401));
   }
@@ -171,7 +178,7 @@ exports.logout = catchAsync(async (req, res, next) => {
 exports.getMe = catchAsync(async (req, res, next) => {
   res.status(200).json({
     status: 'success',
-    data: { user: req.user }
+    data: { user: req.user, userType: req.userType }
   });
 });
 
@@ -276,13 +283,14 @@ exports.verifyEmail = catchAsync(async (req, res, next) => {
 // Change phone number
 exports.changePhone = catchAsync(async (req, res, next) => {
   const { phone } = req.body;
+  const normalizedPhone = normalizeKenyanPhone(phone);
   
-  const existingUser = await User.findOne({ phone });
+  const existingUser = await User.findOne({ phone: normalizedPhone });
   if (existingUser && existingUser._id.toString() !== req.user.id) {
     return next(new AppError('Phone number already in use', 400));
   }
   
-  req.user.phone = phone;
+  req.user.phone = normalizedPhone;
   await req.user.save();
   
   res.status(200).json({
