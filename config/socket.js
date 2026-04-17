@@ -3,7 +3,8 @@ const jwt = require('jsonwebtoken');
 const Ride = require('../models/Ride');
 const Driver = require('../models/Driver');
 const User = require('../models/User');
-const { getDirections, calculateFare } = require('./ors');
+const { getDirections } = require('./ors');
+const { calculateRidePricing } = require('../utils/pricing');
 
 let io;
 
@@ -90,7 +91,12 @@ const initializeSocket = (server) => {
           [destination.longitude, destination.latitude]
         );
         
-        const fare = calculateFare(route.distance / 1000);
+        const pricing = await calculateRidePricing({
+          distanceKm: route.distance / 1000,
+          durationMinutes: route.duration / 60,
+          pickupAddress: pickup.address,
+          destinationAddress: destination.address
+        });
         
         // Create ride request
         const ride = await Ride.create({
@@ -107,9 +113,12 @@ const initializeSocket = (server) => {
           },
           distance: route.distance / 1000,
           duration: route.duration / 60,
-          fare: fare,
+          fare: pricing.fare,
+          pricingBreakdown: pricing.breakdown,
           vehicleType: vehicleType || 'standard',
-          status: 'pending'
+          paymentMethod: data.paymentMethod || 'cash',
+          status: 'pending',
+          timeline: [{ status: 'pending', note: 'Ride requested via socket' }]
         });
         
         // Find nearby available drivers
@@ -145,7 +154,8 @@ const initializeSocket = (server) => {
           fare: ride.fare,
           distance: ride.distance,
           duration: ride.duration,
-          estimatedPickup: '3-5 minutes'
+          estimatedPickup: '3-5 minutes',
+          pricingBreakdown: ride.pricingBreakdown
         });
       } catch (error) {
         console.error('Ride request error:', error);
@@ -167,6 +177,7 @@ const initializeSocket = (server) => {
         ride.driverId = socket.userId;
         ride.status = 'accepted';
         ride.acceptedAt = new Date();
+        ride.timeline.push({ status: 'accepted', note: 'Ride accepted by driver' });
         await ride.save();
         
         // Update driver status
@@ -266,6 +277,66 @@ const initializeSocket = (server) => {
         console.error('Ride completion error:', error);
       }
     });
+
+    socket.on('ride:arrived', async (data) => {
+      try {
+        const ride = await Ride.findById(data.rideId);
+        if (!ride || ride.driverId?.toString() !== socket.userId) return;
+
+        ride.status = 'arrived';
+        ride.arrivedAt = new Date();
+        ride.timeline.push({ status: 'arrived', note: 'Driver arrived at pickup' });
+        await ride.save();
+
+        io.to(`user:${ride.userId}`).emit('ride:arrived', { rideId: ride._id });
+      } catch (error) {
+        console.error('Ride arrived error:', error);
+      }
+    });
+
+    socket.on('ride:start', async (data) => {
+      try {
+        const ride = await Ride.findById(data.rideId);
+        if (!ride || ride.driverId?.toString() !== socket.userId) return;
+
+        ride.status = 'started';
+        ride.startedAt = new Date();
+        ride.timeline.push({ status: 'started', note: 'Ride started' });
+        await ride.save();
+
+        io.to(`user:${ride.userId}`).emit('ride:started', { rideId: ride._id });
+      } catch (error) {
+        console.error('Ride start error:', error);
+      }
+    });
+
+    socket.on('ride:message', async (data) => {
+      try {
+        const ride = await Ride.findById(data.rideId);
+        if (!ride) return;
+
+        const isParticipant =
+          ride.userId.toString() === socket.userId ||
+          ride.driverId?.toString() === socket.userId;
+
+        if (!isParticipant) return;
+
+        ride.messages.push({
+          senderType: socket.userType,
+          senderId: socket.userId,
+          text: data.text
+        });
+        await ride.save();
+
+        const message = ride.messages[ride.messages.length - 1];
+        io.to(`user:${ride.userId}`).emit('ride:message', { rideId: ride._id, message });
+        if (ride.driverId) {
+          io.to(`user:${ride.driverId}`).emit('ride:message', { rideId: ride._id, message });
+        }
+      } catch (error) {
+        console.error('Ride message error:', error);
+      }
+    });
     
     // Handle ride cancellation
     socket.on('ride:cancel', async (data) => {
@@ -278,6 +349,7 @@ const initializeSocket = (server) => {
         ride.status = 'cancelled';
         ride.cancelledAt = new Date();
         ride.cancellationReason = reason;
+        ride.timeline.push({ status: 'cancelled', note: reason || 'Ride cancelled' });
         await ride.save();
         
         // Notify other party

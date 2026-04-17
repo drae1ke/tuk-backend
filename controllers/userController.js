@@ -8,16 +8,34 @@ const { reverseGeocode } = require('../config/ors');
 // Get user profile
 exports.getUserProfile = catchAsync(async (req, res, next) => {
   const user = await User.findById(req.user.id);
+  const activeRide = await Ride.findOne({
+    userId: req.user.id,
+    status: { $in: ['pending', 'accepted', 'arrived', 'started'] }
+  }).populate('driverId', 'name phone rating vehicle currentLocation');
+  const completedRides = await Ride.countDocuments({ userId: req.user.id, status: 'completed' });
+  const totalSpentAgg = await Ride.aggregate([
+    { $match: { userId: req.user._id, status: 'completed' } },
+    { $group: { _id: null, total: { $sum: '$fare' } } }
+  ]);
   
   res.status(200).json({
     status: 'success',
-    data: { user }
+    data: {
+      user,
+      stats: {
+        totalRides: completedRides,
+        totalSpent: totalSpentAgg[0]?.total || 0,
+        savedAddresses: user.savedAddresses.length,
+        memberSince: user.createdAt
+      },
+      activeRide
+    }
   });
 });
 
 // Update user profile
 exports.updateUserProfile = catchAsync(async (req, res, next) => {
-  const allowedFields = ['name', 'phone', 'profilePhoto'];
+  const allowedFields = ['name', 'phone', 'profilePhoto', 'preferredLanguage', 'emergencyContact'];
   const filteredBody = {};
   
   Object.keys(req.body).forEach(key => {

@@ -2,8 +2,26 @@ const Ride = require('../models/Ride');
 const User = require('../models/User');
 const Driver = require('../models/Driver');
 const { getDirections, calculateFare } = require('../config/ors');
+const { calculateRidePricing } = require('../utils/pricing');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
+
+const mapRideSummary = (ride) => ({
+  id: ride._id,
+  fare: ride.fare,
+  distance: ride.distance,
+  duration: ride.duration,
+  status: ride.status,
+  createdAt: ride.createdAt,
+  pickupLocation: ride.pickupLocation,
+  destination: ride.destination,
+  paymentMethod: ride.paymentMethod,
+  paymentStatus: ride.paymentStatus,
+  vehicleType: ride.vehicleType,
+  pricingBreakdown: ride.pricingBreakdown,
+  driverId: ride.driverId,
+  userId: ride.userId
+});
 // Estimate fare before requesting a ride
 exports.estimateRide = catchAsync(async (req, res, next) => {
   const { pickup, destination, vehicleType } = req.body;
@@ -15,17 +33,37 @@ exports.estimateRide = catchAsync(async (req, res, next) => {
     const route = await getDirections(start, end);
     const distance = route.distance / 1000;
     const duration = route.duration / 60;
-    const fare = calculateFare(distance);
+    const pricing = await calculateRidePricing({
+      distanceKm: distance,
+      durationMinutes: duration,
+      pickupAddress: pickup.address,
+      destinationAddress: destination.address
+    });
+    const nearbyDrivers = await Driver.find({
+      online: true,
+      available: true,
+      status: 'active',
+      currentLocation: {
+        $near: {
+          $geometry: {
+            type: 'Point',
+            coordinates: [pickup.longitude, pickup.latitude]
+          },
+          $maxDistance: 4000
+        }
+      }
+    }).limit(6).select('name rating vehicle currentLocation lastLocationUpdate');
 
     res.status(200).json({
       status: 'success',
       data: {
         estimate: {
-          fare,
+          fare: pricing.fare,
           distance,
           duration,
-          currency: 'KES',
+          currency: pricing.breakdown.currency,
           vehicleType: vehicleType || 'standard',
+          pricingBreakdown: pricing.breakdown,
           pickup: {
             latitude: pickup.latitude,
             longitude: pickup.longitude,
@@ -35,7 +73,15 @@ exports.estimateRide = catchAsync(async (req, res, next) => {
             latitude: destination.latitude,
             longitude: destination.longitude,
             address: destination.address || 'Destination'
-          }
+          },
+          nearbyDrivers: nearbyDrivers.map((driver) => ({
+            id: driver._id,
+            name: driver.name,
+            rating: driver.rating,
+            vehicle: driver.vehicle,
+            currentLocation: driver.currentLocation,
+            lastLocationUpdate: driver.lastLocationUpdate
+          }))
         }
       }
     });
@@ -58,7 +104,12 @@ exports.requestRide = catchAsync(async (req, res, next) => {
     
     const distance = route.distance / 1000;
     const duration = route.duration / 60;
-    const fare = calculateFare(distance);
+    const pricing = await calculateRidePricing({
+      distanceKm: distance,
+      durationMinutes: duration,
+      pickupAddress: pickup.address,
+      destinationAddress: destination.address
+    });
     
     const ride = await Ride.create({
       userId: req.user.id,
@@ -74,10 +125,12 @@ exports.requestRide = catchAsync(async (req, res, next) => {
       },
       distance,
       duration,
-      fare,
+      fare: pricing.fare,
+      pricingBreakdown: pricing.breakdown,
       vehicleType: vehicleType || 'standard',
       paymentMethod: paymentMethod || 'cash',
-      status: 'pending'
+      status: 'pending',
+      timeline: [{ status: 'pending', note: 'Ride requested' }]
     });
     
     res.status(201).json({
@@ -90,7 +143,8 @@ exports.requestRide = catchAsync(async (req, res, next) => {
           duration: ride.duration,
           status: ride.status,
           vehicleType: ride.vehicleType,
-          paymentMethod: ride.paymentMethod
+          paymentMethod: ride.paymentMethod,
+          pricingBreakdown: ride.pricingBreakdown
         }
       }
     });
@@ -121,6 +175,7 @@ exports.acceptRide = catchAsync(async (req, res, next) => {
   ride.driverId = driver._id;
   ride.status = 'accepted';
   ride.acceptedAt = new Date();
+  ride.timeline.push({ status: 'accepted', note: 'Ride accepted by driver' });
   await ride.save();
   
   driver.available = false;
@@ -174,6 +229,7 @@ exports.cancelRide = catchAsync(async (req, res, next) => {
   ride.cancelledAt = new Date();
   ride.cancellationReason = reason;
   ride.cancelledBy = req.userType;
+  ride.timeline.push({ status: 'cancelled', note: reason || 'Ride cancelled' });
   await ride.save();
   
   if (ride.driverId) {
@@ -255,7 +311,8 @@ exports.trackRide = catchAsync(async (req, res, next) => {
       driverLocation: ride.driverId?.currentLocation,
       pickupLocation: ride.pickupLocation,
       destination: ride.destination,
-      path: ride.path?.slice(-50) || []
+      path: ride.path?.slice(-50) || [],
+      pricingBreakdown: ride.pricingBreakdown
     }
   });
 });
@@ -277,7 +334,7 @@ exports.getUserRideHistory = catchAsync(async (req, res, next) => {
   res.status(200).json({
     status: 'success',
     data: { 
-      rides, 
+      rides: rides.map(mapRideSummary), 
       pagination: { 
         page, 
         limit, 
@@ -305,7 +362,7 @@ exports.getDriverRideHistory = catchAsync(async (req, res, next) => {
   res.status(200).json({
     status: 'success',
     data: { 
-      rides, 
+      rides: rides.map(mapRideSummary), 
       pagination: { 
         page, 
         limit, 
@@ -381,6 +438,7 @@ exports.arriveAtPickup = catchAsync(async (req, res, next) => {
   
   ride.status = 'arrived';
   ride.arrivedAt = new Date();
+  ride.timeline.push({ status: 'arrived', note: 'Driver arrived at pickup' });
   await ride.save();
   
   res.status(200).json({
@@ -404,6 +462,7 @@ exports.startRide = catchAsync(async (req, res, next) => {
   
   ride.status = 'started';
   ride.startedAt = new Date();
+  ride.timeline.push({ status: 'started', note: 'Ride started' });
   await ride.save();
   
   res.status(200).json({
@@ -427,6 +486,8 @@ exports.completeRide = catchAsync(async (req, res, next) => {
   
   ride.status = 'completed';
   ride.completedAt = new Date();
+  ride.paymentStatus = ride.paymentMethod === 'cash' ? 'pending' : 'paid';
+  ride.timeline.push({ status: 'completed', note: 'Ride completed' });
   await ride.save();
   
   const driver = await Driver.findById(req.user.id);
@@ -435,9 +496,90 @@ exports.completeRide = catchAsync(async (req, res, next) => {
   driver.totalRides += 1;
   driver.totalEarnings += ride.fare;
   await driver.save();
+
+  await User.findByIdAndUpdate(ride.userId, {
+    $inc: { totalRides: 1, totalSpent: ride.fare }
+  });
   
   res.status(200).json({
     status: 'success',
     data: { ride }
+  });
+});
+
+exports.getNearbyDriverPreview = catchAsync(async (req, res, next) => {
+  const { latitude, longitude, radius = 4 } = req.query;
+
+  const drivers = await Driver.find({
+    online: true,
+    available: true,
+    status: 'active',
+    currentLocation: {
+      $near: {
+        $geometry: {
+          type: 'Point',
+          coordinates: [parseFloat(longitude), parseFloat(latitude)]
+        },
+        $maxDistance: parseFloat(radius) * 1000
+      }
+    }
+  }).limit(8).select('name rating vehicle currentLocation lastLocationUpdate');
+
+  res.status(200).json({
+    status: 'success',
+    data: {
+      drivers,
+      count: drivers.length
+    }
+  });
+});
+
+exports.getRideMessages = catchAsync(async (req, res, next) => {
+  const ride = await Ride.findById(req.params.rideId).select('userId driverId messages');
+  if (!ride) {
+    return next(new AppError('Ride not found', 404));
+  }
+
+  const isParticipant =
+    ride.userId.toString() === req.user.id ||
+    ride.driverId?.toString() === req.user.id;
+
+  if (!isParticipant && req.user.role !== 'admin') {
+    return next(new AppError('Not authorized to view ride messages', 403));
+  }
+
+  res.status(200).json({
+    status: 'success',
+    data: { messages: ride.messages || [] }
+  });
+});
+
+exports.sendRideMessage = catchAsync(async (req, res, next) => {
+  const { text } = req.body;
+  const ride = await Ride.findById(req.params.rideId).select('userId driverId status messages');
+  if (!ride) {
+    return next(new AppError('Ride not found', 404));
+  }
+
+  const isParticipant =
+    ride.userId.toString() === req.user.id ||
+    ride.driverId?.toString() === req.user.id;
+
+  if (!isParticipant && req.user.role !== 'admin') {
+    return next(new AppError('Not authorized to message on this ride', 403));
+  }
+
+  const message = {
+    senderType: req.user.role === 'admin' ? 'admin' : req.userType,
+    senderId: req.user._id,
+    text
+  };
+
+  ride.messages.push(message);
+  await ride.save();
+
+  res.status(201).json({
+    status: 'success',
+    data: { message: ride.messages[ride.messages.length - 1] }
   });
 });

@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Driver = require('../models/Driver');
+const Session = require('../models/Session');
 
 const protect = async (req, res, next) => {
   try {
@@ -36,6 +37,15 @@ const protect = async (req, res, next) => {
     
     req.user = user;
     req.userType = decoded.userType;
+    req.sessionId = req.headers['x-session-id'] || null;
+
+    if (req.sessionId) {
+      await Session.findOneAndUpdate(
+        { sessionId: req.sessionId, accountId: decoded.id, accountType: decoded.userType, isActive: true },
+        { lastSeenAt: new Date(), userAgent: req.headers['user-agent'], ipAddress: req.ip },
+        { new: true }
+      );
+    }
     next();
   } catch (error) {
     if (error.name === 'JsonWebTokenError') {

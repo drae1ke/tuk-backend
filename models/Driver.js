@@ -117,6 +117,19 @@ const driverSchema = new mongoose.Schema({
     accountName: String
   },
   mpesaNumber: String,
+  operatingCity: {
+    type: String,
+    default: 'Nairobi'
+  },
+  serviceAreas: [{
+    type: String
+  }],
+  bio: String,
+  emergencyContact: {
+    name: String,
+    phone: String,
+    relationship: String
+  },
   pushToken: String,
   isActive: {
     type: Boolean,
@@ -141,8 +154,8 @@ driverSchema.index({ currentLocation: '2dsphere' });
 driverSchema.index({ online: 1, available: 1, status: 1 });
 
 // Hash password
-driverSchema.pre('save', async function(next) {
-  if (!this.isModified('password')) return next();
+driverSchema.pre('save', async function() {
+  if (!this.isModified('password')) return;
   this.password = await bcrypt.hash(this.password, 12);
 });
 

@@ -9,16 +9,29 @@ const { calculateDistance } = require('../utils/geoUtils');
 exports.getDriverProfile = catchAsync(async (req, res, next) => {
   const driver = await Driver.findById(req.user.id)
     .populate('currentRide', 'status pickupLocation destination');
+  const completedToday = await Ride.countDocuments({
+    driverId: req.user.id,
+    status: 'completed',
+    completedAt: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) }
+  });
   
   res.status(200).json({
     status: 'success',
-    data: { driver }
+    data: {
+      driver,
+      summary: {
+        completedToday,
+        totalEarnings: driver.totalEarnings,
+        totalRides: driver.totalRides,
+        rating: driver.rating
+      }
+    }
   });
 });
 
 // Update driver profile
 exports.updateDriverProfile = catchAsync(async (req, res, next) => {
-  const allowedFields = ['name', 'phone', 'profilePhoto'];
+  const allowedFields = ['name', 'phone', 'profilePhoto', 'bio', 'mpesaNumber', 'operatingCity', 'serviceAreas', 'emergencyContact'];
   const filteredBody = {};
   
   Object.keys(req.body).forEach(key => {
@@ -230,11 +243,28 @@ exports.getNearbyDrivers = catchAsync(async (req, res, next) => {
         $maxDistance: radius * 1000 // Convert km to meters
       }
     }
-  }).limit(20);
-  
+  }).limit(20).select('name phone rating vehicle currentLocation lastLocationUpdate operatingCity');
+
   res.status(200).json({
     status: 'success',
-    data: { drivers, count: drivers.length }
+    data: {
+      drivers: drivers.map((driver) => {
+        const [lng, lat] = driver.currentLocation.coordinates;
+        const distanceKm = calculateDistance(parseFloat(latitude), parseFloat(longitude), lat, lng);
+        return {
+          id: driver._id,
+          name: driver.name,
+          phone: driver.phone,
+          rating: driver.rating,
+          vehicle: driver.vehicle,
+          operatingCity: driver.operatingCity,
+          distanceKm: Number(distanceKm.toFixed(2)),
+          currentLocation: driver.currentLocation,
+          lastLocationUpdate: driver.lastLocationUpdate
+        };
+      }),
+      count: drivers.length
+    }
   });
 });
 

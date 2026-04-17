@@ -23,6 +23,10 @@ router.get('/user/current',
   restrictUserType('user'),
   rideController.getCurrentUserRide
 );
+router.get('/user/nearby-drivers',
+  restrictUserType('user'),
+  rideController.getNearbyDriverPreview
+);
 
 router.post('/request', 
   restrictUserType('user'),
@@ -82,5 +86,7 @@ router.get('/:rideId',
 router.get('/:rideId/track', 
   rideController.trackRide
 );
+router.get('/:rideId/messages', rideController.getRideMessages);
+router.post('/:rideId/messages', rideController.sendRideMessage);
 
 module.exports = router;

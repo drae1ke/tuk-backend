@@ -96,6 +96,21 @@ const rideSchema = new mongoose.Schema({
     default: 'pending'
   },
   paymentId: String,
+  pricingBreakdown: {
+    currency: {
+      type: String,
+      default: 'KES'
+    },
+    baseFare: Number,
+    distanceFare: Number,
+    timeFare: Number,
+    bookingFee: Number,
+    nightSurcharge: Number,
+    trafficSurcharge: Number,
+    zoneSurcharge: Number,
+    demandMultiplier: Number,
+    subtotal: Number
+  },
   cancellationReason: String,
   cancellationFee: {
     type: Number,
@@ -123,7 +138,34 @@ const rideSchema = new mongoose.Schema({
   completedAt: Date,
   cancelledAt: Date,
   estimatedPickupTime: Date,
-  estimatedDropoffTime: Date
+  estimatedDropoffTime: Date,
+  messages: [{
+    senderType: {
+      type: String,
+      enum: ['user', 'driver', 'admin']
+    },
+    senderId: {
+      type: mongoose.Schema.Types.ObjectId,
+      required: true
+    },
+    text: {
+      type: String,
+      trim: true,
+      maxlength: 500
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
+  timeline: [{
+    status: String,
+    note: String,
+    createdAt: {
+      type: Date,
+      default: Date.now
+    }
+  }]
 }, {
   timestamps: true
 });

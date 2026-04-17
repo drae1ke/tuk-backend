@@ -43,6 +43,19 @@ const userSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  totalSpent: {
+    type: Number,
+    default: 0
+  },
+  preferredLanguage: {
+    type: String,
+    default: 'en'
+  },
+  emergencyContact: {
+    name: String,
+    phone: String,
+    relationship: String
+  },
   savedAddresses: [{
     name: String,
     address: String,
@@ -80,6 +93,10 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  phoneVerified: {
+    type: Boolean,
+    default: false
+  },
   emailVerificationToken: String,
   createdAt: {
     type: Date,
@@ -94,7 +111,7 @@ const userSchema = new mongoose.Schema({
 userSchema.index({ 'savedAddresses.location': '2dsphere' });
 
 // Hash password before saving
-userSchema.pre('save', async function(next) {
+userSchema.pre('save', async function() {
   if (!this.isModified('password')) return;
   this.password = await bcrypt.hash(this.password, 12);
 });

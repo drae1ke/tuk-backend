@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const User = require('../models/User');
 const Driver = require('../models/Driver');
+const Session = require('../models/Session');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../utils/emailService');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
@@ -17,8 +18,28 @@ const signToken = (id, userType) => {
 };
 
 // Create and send token
-const createSendToken = (user, statusCode, res, userType = 'user') => {
+const registerSession = async (req, user, userType) => {
+  const sessionId = req.headers['x-session-id'];
+  if (!sessionId) return null;
+
+  return Session.findOneAndUpdate(
+    { sessionId },
+    {
+      sessionId,
+      accountId: user._id,
+      accountType: userType,
+      isActive: true,
+      userAgent: req.headers['user-agent'],
+      ipAddress: req.ip,
+      lastSeenAt: new Date()
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+};
+
+const createSendToken = async (req, user, statusCode, res, userType = 'user') => {
   const token = signToken(user._id, userType);
+  await registerSession(req, user, userType);
   
   // Remove password from output
   user.password = undefined;
@@ -42,7 +63,7 @@ exports.register = catchAsync(async (req, res, next) => {
   // Check if user exists
   const existingUser = await User.findOne({ $or: [{ email: normalizedEmail }, { phone: normalizedPhone }] });
   if (existingUser) {
-    return next(new AppError('User already exists with this email or phone', 400));
+    throw new AppError('User already exists with this email or phone', 400);
   }
   
   // Create email verification token
@@ -61,24 +82,45 @@ exports.register = catchAsync(async (req, res, next) => {
   // Send verification email
   await sendVerificationEmail(email, emailVerificationToken);
   
-  createSendToken(user, 201, res);
+  await createSendToken(req, user, 201, res);
 });
 
-// Login user
+const findAccountForLogin = async (email) => {
+  const user = await User.findOne({ email }).select('+password');
+  if (user) {
+    return { account: user, userType: 'user' };
+  }
+
+  const driver = await Driver.findOne({ email }).select('+password');
+  if (driver) {
+    return { account: driver, userType: 'driver' };
+  }
+
+  return { account: null, userType: null };
+};
+
+// Unified login for client, driver, and admin
 exports.login = catchAsync(async (req, res, next) => {
   const { email, password } = req.body;
   const normalizedEmail = email.toLowerCase();
   
-  // Check if user exists
-  const user = await User.findOne({ email: normalizedEmail }).select('+password');
-  if (!user || !(await user.comparePassword(password))) {
-    return next(new AppError('Invalid email or password', 401));
+  const { account, userType } = await findAccountForLogin(normalizedEmail);
+  if (!account || !(await account.comparePassword(password))) {
+    throw new AppError('Invalid email or password', 401);
+  }
+
+  if (userType === 'driver' && account.status !== 'active') {
+    throw new AppError(`Your account is ${account.status}. Please contact support.`, 403);
   }
   
-  // Update last login
-  await user.updateLastLogin();
+  if (userType === 'driver') {
+    account.lastActive = new Date();
+    await account.save();
+  } else if (typeof account.updateLastLogin === 'function') {
+    await account.updateLastLogin();
+  }
   
-  createSendToken(user, 200, res);
+  await createSendToken(req, account, 200, res, userType);
 });
 
 // Register driver
@@ -93,7 +135,7 @@ exports.registerDriver = catchAsync(async (req, res, next) => {
   // Check if driver exists
   const existingDriver = await Driver.findOne({ $or: [{ email: normalizedEmail }, { phone: normalizedPhone }, { idNumber }, { licenseNumber }, { 'vehicle.plateNumber': plateNumber }] });
   if (existingDriver) {
-    return next(new AppError('Driver already registered with this information', 400));
+    throw new AppError('Driver already registered with this information', 400);
   }
   
   // Create driver (pending approval)
@@ -113,28 +155,10 @@ exports.registerDriver = catchAsync(async (req, res, next) => {
   
   // Send notification to admin (implement later)
   
-  createSendToken(driver, 201, res, 'driver');
+  await createSendToken(req, driver, 201, res, 'driver');
 });
 
-// Driver login
-exports.driverLogin = catchAsync(async (req, res, next) => {
-  const { email, password } = req.body;
-  const normalizedEmail = email.toLowerCase();
-  
-  const driver = await Driver.findOne({ email: normalizedEmail }).select('+password');
-  if (!driver || !(await driver.comparePassword(password))) {
-    return next(new AppError('Invalid email or password', 401));
-  }
-  
-  if (driver.status !== 'active') {
-    return next(new AppError(`Your account is ${driver.status}. Please contact support.`, 403));
-  }
-  
-  driver.lastActive = new Date();
-  await driver.save();
-  
-  createSendToken(driver, 200, res, 'driver');
-});
+exports.driverLogin = exports.login;
 
 // Refresh token
 exports.refreshToken = catchAsync(async (req, res, next) => {
@@ -151,7 +175,7 @@ exports.refreshToken = catchAsync(async (req, res, next) => {
     }
     
     if (!user) {
-      return next(new AppError('User not found', 404));
+      throw new AppError('User not found', 404);
     }
     
     const newToken = signToken(user._id, decoded.userType);
@@ -161,12 +185,15 @@ exports.refreshToken = catchAsync(async (req, res, next) => {
       token: newToken
     });
   } catch (error) {
-    return next(new AppError('Invalid refresh token', 401));
+    throw new AppError('Invalid refresh token', 401);
   }
 });
 
 // Logout
 exports.logout = catchAsync(async (req, res, next) => {
+  if (req.sessionId) {
+    await Session.findOneAndUpdate({ sessionId: req.sessionId }, { isActive: false, lastSeenAt: new Date() });
+  }
   // Invalidate token on client side
   res.status(200).json({
     status: 'success',
@@ -194,13 +221,13 @@ exports.updatePassword = catchAsync(async (req, res, next) => {
   }
   
   if (!(await user.comparePassword(currentPassword))) {
-    return next(new AppError('Current password is incorrect', 401));
+    throw new AppError('Current password is incorrect', 401);
   }
   
   user.password = newPassword;
   await user.save();
   
-  createSendToken(user, 200, res, req.userType);
+  await createSendToken(req, user, 200, res, req.userType);
 });
 
 // Forgot password
@@ -209,7 +236,7 @@ exports.forgotPassword = catchAsync(async (req, res, next) => {
   
   const user = await User.findOne({ email });
   if (!user) {
-    return next(new AppError('No user found with that email', 404));
+    throw new AppError('No user found with that email', 404);
   }
   
   const resetToken = crypto.randomBytes(32).toString('hex');
@@ -233,7 +260,7 @@ exports.forgotPassword = catchAsync(async (req, res, next) => {
     user.resetPasswordExpire = undefined;
     await user.save({ validateBeforeSave: false });
     
-    return next(new AppError('Error sending email. Please try again later.', 500));
+    throw new AppError('Error sending email. Please try again later.', 500);
   }
 });
 
@@ -250,7 +277,7 @@ exports.resetPassword = catchAsync(async (req, res, next) => {
   });
   
   if (!user) {
-    return next(new AppError('Invalid or expired token', 400));
+    throw new AppError('Invalid or expired token', 400);
   }
   
   user.password = req.body.password;
@@ -258,7 +285,7 @@ exports.resetPassword = catchAsync(async (req, res, next) => {
   user.resetPasswordExpire = undefined;
   await user.save();
   
-  createSendToken(user, 200, res);
+  await createSendToken(req, user, 200, res);
 });
 
 // Verify email
@@ -267,7 +294,7 @@ exports.verifyEmail = catchAsync(async (req, res, next) => {
   
   const user = await User.findOne({ emailVerificationToken: token });
   if (!user) {
-    return next(new AppError('Invalid or expired verification token', 400));
+    throw new AppError('Invalid or expired verification token', 400);
   }
   
   user.emailVerified = true;
@@ -287,7 +314,7 @@ exports.changePhone = catchAsync(async (req, res, next) => {
   
   const existingUser = await User.findOne({ phone: normalizedPhone });
   if (existingUser && existingUser._id.toString() !== req.user.id) {
-    return next(new AppError('Phone number already in use', 400));
+    throw new AppError('Phone number already in use', 400);
   }
   
   req.user.phone = normalizedPhone;
@@ -314,6 +341,37 @@ exports.verifyPhone = catchAsync(async (req, res, next) => {
       message: 'Phone verified successfully'
     });
   } else {
-    return next(new AppError('Invalid OTP', 400));
+    throw new AppError('Invalid OTP', 400);
   }
+});
+
+exports.getSessions = catchAsync(async (req, res, next) => {
+  const sessions = await Session.find({
+    accountId: req.user.id,
+    accountType: req.userType,
+    isActive: true
+  }).sort('-lastSeenAt');
+
+  res.status(200).json({
+    status: 'success',
+    data: { sessions }
+  });
+});
+
+exports.logoutSession = catchAsync(async (req, res, next) => {
+  const { sessionId } = req.params;
+  const session = await Session.findOneAndUpdate(
+    { sessionId, accountId: req.user.id, accountType: req.userType },
+    { isActive: false, lastSeenAt: new Date() },
+    { new: true }
+  );
+
+  if (!session) {
+    throw new AppError('Session not found', 404);
+  }
+
+  res.status(200).json({
+    status: 'success',
+    message: 'Session closed successfully'
+  });
 });
