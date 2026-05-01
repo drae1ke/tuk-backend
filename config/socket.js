@@ -58,7 +58,7 @@ const initializeSocket = (server) => {
         // Notify nearby users with active ride requests
         const nearbyRequests = await Ride.find({
           status: 'pending',
-          'pickupLocation.coordinates': {
+          pickupLocation: {
             $near: {
               $geometry: {
                 type: 'Point',

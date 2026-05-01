@@ -52,7 +52,7 @@ module.exports = (io, socket) => {
         available: true,
         status: 'active',
         commissionAccountStatus: 'active',
-        'currentLocation.coordinates': {
+        currentLocation: {
           $near: {
             $geometry: {
               type: 'Point',

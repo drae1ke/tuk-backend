@@ -4,7 +4,12 @@ const Ride = require('../models/Ride');
 const PricingConfig = require('../models/PricingConfig');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
-const { DEFAULT_PRICING, invalidatePricingCache } = require('../utils/pricing');
+const {
+  DEFAULT_PRICING,
+  getPricingConfig,
+  invalidatePricingCache,
+  normalizePricingConfig,
+} = require('../utils/pricing');
 const { runWeeklySettlement } = require('../services/commissionService');
 
 exports.getDrivers = catchAsync(async (req, res) => {
@@ -120,10 +125,7 @@ exports.getDashboardStats = catchAsync(async (req, res) => {
 });
 
 exports.getPricing = catchAsync(async (req, res) => {
-  let pricing = await PricingConfig.findOne().sort('-updatedAt');
-  if (!pricing) {
-    pricing = await PricingConfig.create(DEFAULT_PRICING);
-  }
+  const pricing = await getPricingConfig();
 
   res.status(200).json({
     status: 'success',
@@ -144,12 +146,14 @@ exports.updatePricing = catchAsync(async (req, res) => {
     }
   });
 
+  Object.assign(pricing, normalizePricingConfig(pricing.toObject()));
   await pricing.save();
   invalidatePricingCache();
+  const normalizedPricing = await getPricingConfig();
 
   res.status(200).json({
     status: 'success',
-    data: { pricing }
+    data: { pricing: normalizedPricing }
   });
 });
 

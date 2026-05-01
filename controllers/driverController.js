@@ -250,7 +250,7 @@ exports.getNearbyDrivers = catchAsync(async (req, res, next) => {
     available: true,
     status: 'active',
     commissionAccountStatus: 'active',
-    'currentLocation.coordinates': {
+    currentLocation: {
       $near: {
         $geometry: {
           type: 'Point',

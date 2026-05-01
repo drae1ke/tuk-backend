@@ -91,7 +91,14 @@ const _sendDriverNotification = async ({ driver, commissions = [], type, subject
  * the ground-truth Commission collection.  Call this after any mutation.
  */
 const refreshDriverCommissionState = async (driverId, { now = new Date() } = {}) => {
+  console.log('[Commission] refreshDriverCommissionState START:', {
+    driverId,
+    now: now.toISOString(),
+    timezone: DEFAULT_TIMEZONE
+  });
+  
   const { weekStart, weekEnd } = getWeekWindow(now, DEFAULT_TIMEZONE);
+  console.log('[Commission] Week window:', { weekStart, weekEnd });
 
   const [driver, currentWeekCommission, outstandingCommissions] = await Promise.all([
     Driver.findById(driverId),
@@ -103,13 +110,35 @@ const refreshDriverCommissionState = async (driverId, { now = new Date() } = {})
     }).sort({ weekStart: 1 }),
   ]);
 
-  if (!driver) return null;
+  console.log('[Commission] Data fetched:', {
+    driverId,
+    driverFound: !!driver,
+    currentWeekCommissionFound: !!currentWeekCommission,
+    currentWeekCommissionAmount: currentWeekCommission?.amount,
+    outstandingCommissionsCount: outstandingCommissions.length
+  });
+
+  if (!driver) {
+    console.log('[Commission] Driver not found, returning null');
+    return null;
+  }
 
   const outstandingCommissionBalance = roundCurrency(
     outstandingCommissions.reduce((s, c) => s + Number(c.outstandingAmount || 0), 0)
   );
 
-  // Restricted if any outstanding commission has passed its grace deadline
+  console.log('[Commission] Outstanding commissions:', {
+    count: outstandingCommissions.length,
+    totalBalance: outstandingCommissionBalance,
+    details: outstandingCommissions.map(c => ({
+      weekStart: c.weekStart,
+      status: c.status,
+      amount: c.amount,
+      dueAmount: c.dueAmount,
+      outstandingAmount: c.outstandingAmount
+    }))
+  });
+
   const shouldRestrict = outstandingCommissions.some(
     (c) => c.graceEndsAt && new Date(c.graceEndsAt) < now
   );
@@ -118,6 +147,12 @@ const refreshDriverCommissionState = async (driverId, { now = new Date() } = {})
     .map((c) => c.graceEndsAt)
     .filter(Boolean)
     .sort((a, b) => a.getTime() - b.getTime())[0] || null;
+
+  console.log('[Commission] Restriction check:', {
+    shouldRestrict,
+    earliestGrace,
+    overdueCount: outstandingCommissions.filter(c => c.graceEndsAt && new Date(c.graceEndsAt) < now).length
+  });
 
   const canBeAvailable =
     driver.status === 'active' &&
@@ -138,7 +173,12 @@ const refreshDriverCommissionState = async (driverId, { now = new Date() } = {})
     available: canBeAvailable,
   };
 
+  console.log('[Commission] Updating driver with:', updates);
+  
   await Driver.findByIdAndUpdate(driverId, updates);
+  
+  console.log('[Commission] Driver updated successfully');
+  
   return { ...updates, canReceiveRideRequests: !shouldRestrict && driver.status === 'active' };
 };
 
@@ -147,35 +187,71 @@ const refreshDriverCommissionState = async (driverId, { now = new Date() } = {})
  * Called immediately after a ride is marked `completed`.
  * Idempotent: uses commissionProcessedAt field to prevent double-counting.
  */
-const recordRideCommission = async (ride) => {
-  console.log('[Commission] recordRideCommission called:', { 
-    rideId: ride?._id, 
-    driverId: ride?.driverId, 
-    status: ride?.status,
-    fare: ride?.fare 
+const recordRideCommission = async (rideRef) => {
+  console.log('[Commission] recordRideCommission START:', {
+    input: rideRef?._id || rideRef,
+    timestamp: new Date().toISOString()
   });
   
-  if (!ride?.driverId || ride.status !== 'completed') {
-    console.log('[Commission] Skipped: not eligible', { reason: 'not-eligible' });
-    return { skipped: true, reason: 'not-eligible' };
+  const rideId = rideRef?._id || rideRef;
+  if (!rideId) {
+    console.log('[Commission] SKIPPED: no rideId provided', { reason: 'no-ride-id' });
+    return { skipped: true, reason: 'no-ride-id' };
   }
+
+  // Always re-read the persisted ride so commission accrual does not depend
+  // on whether the caller passed a fresh or stale in-memory document.
+  console.log('[Commission] Fetching ride from DB:', { rideId });
+  const ride = await Ride.findById(rideId).select(
+    '_id driverId status fare completedAt commissionProcessedAt'
+  );
+
+  console.log('[Commission] Ride fetched from DB:', {
+    rideId: ride?._id,
+    driverId: ride?.driverId,
+    status: ride?.status,
+    fare: ride?.fare,
+    completedAt: ride?.completedAt,
+    commissionProcessedAt: ride?.commissionProcessedAt,
+    rideFound: !!ride
+  });
+
+  if (!ride) {
+    console.log('[Commission] SKIPPED: ride not found in database', { rideId });
+    return { skipped: true, reason: 'ride-not-found' };
+  }
+  
+  if (!ride?.driverId) {
+    console.log('[Commission] SKIPPED: no driverId on ride', { rideId, driverId: ride?.driverId });
+    return { skipped: true, reason: 'no-driver-id' };
+  }
+  
+  if (ride.status !== 'completed') {
+    console.log('[Commission] SKIPPED: ride not completed', { rideId, status: ride.status });
+    return { skipped: true, reason: 'not-completed' };
+  }
+  
+  console.log('[Commission] Ride validation passed, proceeding with accrual');
 
   const completedAt = ride.completedAt ? new Date(ride.completedAt) : new Date();
   const { weekStart, weekEnd } = getWeekWindow(completedAt, DEFAULT_TIMEZONE);
   const commissionAmount = calculateRideCommission(ride.fare);
   const grossFare = roundCurrency(ride.fare);
   
-  console.log('[Commission] Processing ride:', {
+  console.log('[Commission] Calculated commission:', {
     rideId: ride._id,
     driverId: ride.driverId,
     fare: ride.fare,
+    commissionRate: COMMISSION_RATE,
     commissionAmount,
     grossFare,
     weekStart,
-    weekEnd
+    weekEnd,
+    timezone: DEFAULT_TIMEZONE
   });
 
   // Atomic idempotency guard
+  console.log('[Commission] Updating ride with commission metadata...');
   const updated = await Ride.findOneAndUpdate(
     {
       _id: ride._id,
@@ -196,10 +272,26 @@ const recordRideCommission = async (ride) => {
     { new: true }
   );
 
-  if (!updated) return { skipped: true, reason: 'already-processed' };
+  if (!updated) {
+    console.log('[Commission] SKIPPED: ride already processed (idempotency check)', { rideId: ride._id });
+    return { skipped: true, reason: 'already-processed' };
+  }
+  
+  console.log('[Commission] Ride updated with commission info:', {
+    rideId: updated._id,
+    commissionAmount: updated.commissionAmount,
+    commissionProcessedAt: updated.commissionProcessedAt
+  });
 
   // Upsert the commission bucket for this driver-week
-  await Commission.findOneAndUpdate(
+  console.log('[Commission] Upserting Commission record for driver-week:', {
+    driverId: ride.driverId,
+    weekStart,
+    weekEnd,
+    increment_amount: commissionAmount
+  });
+  
+  const commissionRecord = await Commission.findOneAndUpdate(
     { driverId: ride.driverId, weekStart },
     {
       $setOnInsert: {
@@ -227,11 +319,32 @@ const recordRideCommission = async (ride) => {
         },
       },
     },
-    { upsert: true }
+    { upsert: true, new: true }
   );
+  
+  console.log('[Commission] Commission record upserted:', {
+    commissionId: commissionRecord._id,
+    driverId: commissionRecord.driverId,
+    weekStart: commissionRecord.weekStart,
+    totalAmount: commissionRecord.amount,
+    rideCount: commissionRecord.rideCount,
+    grossFares: commissionRecord.grossFares,
+    status: commissionRecord.status
+  });
 
+  console.log('[Commission] Refreshing driver commission state for:', { driverId: ride.driverId });
   await refreshDriverCommissionState(ride.driverId, { now: completedAt });
+  console.log('[Commission] Driver commission state refreshed');
 
+  console.log('[Commission] ✅ recordRideCommission COMPLETED successfully:', {
+    rideId: ride._id,
+    driverId: ride.driverId,
+    commissionAmount,
+    weekStart,
+    weekEnd,
+    timestamp: new Date().toISOString()
+  });
+  
   return { commissionAmount, weekStart, weekEnd };
 };
 

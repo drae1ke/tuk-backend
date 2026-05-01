@@ -18,6 +18,42 @@ let cachedPricing = null;
 let cachedAt = 0;
 const CACHE_TTL = 60_000;
 
+const asNumber = (value) => {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
+const nonNegativeOr = (value, fallback) => {
+  const num = asNumber(value);
+  return num !== null && num >= 0 ? num : fallback;
+};
+
+const positiveOr = (value, fallback) => {
+  const num = asNumber(value);
+  return num !== null && num > 0 ? num : fallback;
+};
+
+const atLeastOneOr = (value, fallback) => {
+  const num = asNumber(value);
+  return num !== null && num >= 1 ? num : fallback;
+};
+
+const normalizePricingConfig = (config = {}) => ({
+  market: config.market || 'kenya',
+  city: config.city || 'Nairobi',
+  currency: config.currency || DEFAULT_PRICING.currency,
+  baseFare: nonNegativeOr(config.baseFare, DEFAULT_PRICING.baseFare),
+  bookingFee: nonNegativeOr(config.bookingFee, DEFAULT_PRICING.bookingFee),
+  perKm: positiveOr(config.perKm, DEFAULT_PRICING.perKm),
+  perMinute: nonNegativeOr(config.perMinute, DEFAULT_PRICING.perMinute),
+  minimumFare: positiveOr(config.minimumFare, DEFAULT_PRICING.minimumFare),
+  cancellationFee: nonNegativeOr(config.cancellationFee, DEFAULT_PRICING.cancellationFee),
+  nightSurcharge: nonNegativeOr(config.nightSurcharge, DEFAULT_PRICING.nightSurcharge),
+  cbdSurcharge: nonNegativeOr(config.cbdSurcharge, DEFAULT_PRICING.cbdSurcharge),
+  trafficMultiplier: atLeastOneOr(config.trafficMultiplier, DEFAULT_PRICING.trafficMultiplier),
+  demandMultiplier: atLeastOneOr(config.demandMultiplier, DEFAULT_PRICING.demandMultiplier),
+});
+
 const getPricingConfig = async () => {
   if (cachedPricing && Date.now() - cachedAt < CACHE_TTL) {
     return cachedPricing;
@@ -29,7 +65,7 @@ const getPricingConfig = async () => {
     config = config.toObject();
   }
 
-  cachedPricing = { ...DEFAULT_PRICING, ...config };
+  cachedPricing = normalizePricingConfig(config);
   cachedAt = Date.now();
   return cachedPricing;
 };
@@ -94,5 +130,6 @@ module.exports = {
   DEFAULT_PRICING,
   getPricingConfig,
   calculateRidePricing,
-  invalidatePricingCache
+  invalidatePricingCache,
+  normalizePricingConfig,
 };

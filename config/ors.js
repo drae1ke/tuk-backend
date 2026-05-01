@@ -5,81 +5,124 @@ const orsConfig = {
   baseURL: process.env.ORS_BASE_URL || 'https://api.openrouteservice.org/v2',
   apiKey: process.env.ORS_API_KEY,
   headers: {
-    'Authorization': process.env.ORS_API_KEY,
+    ...(process.env.ORS_API_KEY ? { Authorization: process.env.ORS_API_KEY } : {}),
     'Content-Type': 'application/json'
   }
 };
 
 const orsClient = axios.create({
   baseURL: orsConfig.baseURL,
-  headers: orsConfig.headers
+  headers: orsConfig.headers,
+  timeout: 10000
 });
 
-// Directions API - FIXED VERSION
+const osrmClient = axios.create({
+  baseURL: process.env.OSRM_BASE_URL || 'https://router.project-osrm.org',
+  timeout: 10000
+});
+
+const haversineDistanceMeters = (start, end) => {
+  const [lng1, lat1] = start;
+  const [lng2, lat2] = end;
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+      Math.sin(dLng / 2) * Math.sin(dLng / 2);
+
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+const buildStraightLineRoute = (start, end) => {
+  const directDistance = haversineDistanceMeters(start, end);
+  const estimatedRoadDistance = Math.max(directDistance * 1.2, 250);
+  const averageSpeedKph = 26;
+  const durationSeconds = (estimatedRoadDistance / 1000 / averageSpeedKph) * 3600;
+
+  return {
+    distance: estimatedRoadDistance,
+    duration: durationSeconds,
+    geometry: {
+      type: 'LineString',
+      coordinates: [start, end],
+    },
+    steps: [],
+    source: 'fallback'
+  };
+};
+
+const getDirectionsFromOrs = async (start, end, profile) => {
+  if (!orsConfig.apiKey) {
+    throw new Error('ORS API key not configured');
+  }
+
+  const response = await orsClient.post(`/directions/${profile}`, {
+    coordinates: [start, end],
+    instructions: true,
+    language: 'en',
+  });
+  const route = response.data?.routes?.[0];
+
+  if (!route?.summary) {
+    throw new Error('ORS did not return a route summary');
+  }
+
+  return {
+    distance: route.summary.distance,
+    duration: route.summary.duration,
+    geometry: route.geometry || null,
+    steps: route.segments?.[0]?.steps || [],
+    source: 'ors'
+  };
+};
+
+const getDirectionsFromOsrm = async (start, end) => {
+  const response = await osrmClient.get(
+    `/route/v1/driving/${start[0]},${start[1]};${end[0]},${end[1]}`,
+    {
+      params: {
+        overview: 'false',
+        steps: 'false',
+      },
+    }
+  );
+  const route = response.data?.routes?.[0];
+
+  if (!route) {
+    throw new Error('OSRM did not return a route');
+  }
+
+  return {
+    distance: route.distance,
+    duration: route.duration,
+    geometry: route.geometry || null,
+    steps: [],
+    source: 'osrm'
+  };
+};
+
 const getDirections = async (start, end, profile = 'driving-car') => {
   try {
-    console.log('📍 Requesting directions from ORS...');
-    console.log('Start:', start);
-    console.log('End:', end);
-    
-    // ORS expects coordinates as [longitude, latitude]
-    const response = await orsClient.post(`/directions/${profile}`, {
-      coordinates: [start, end],
-      instructions: 'true',  // Changed from 'detailed' to 'true'
-      language: 'en',
-      units: 'km'
-    });
-    
-    console.log('✅ Directions received successfully');
-    
-    return {
-      distance: response.data.routes[0].summary.distance,
-      duration: response.data.routes[0].summary.duration,
-      geometry: response.data.routes[0].geometry,
-      steps: response.data.routes[0].segments[0].steps || []
-    };
-  } catch (error) {
-    console.error('❌ ORS Directions Error:');
-    console.error('Status:', error.response?.status);
-    console.error('Data:', error.response?.data);
-    console.error('Message:', error.message);
-    
-    // Return mock data in development
-    if (process.env.NODE_ENV === 'development') {
-      console.log('🔄 Using mock data for development');
-      return {
-        distance: 5000, // 5km in meters
-        duration: 600, // 10 minutes in seconds
-        geometry: null,
-        steps: []
-      };
-    }
-    
-    throw new Error(`Failed to get directions: ${error.response?.data?.error?.message || error.message}`);
+    return await getDirectionsFromOrs(start, end, profile);
+  } catch (orsError) {
+    console.warn('ORS directions failed, falling back:', orsError.response?.data || orsError.message);
   }
-};
 
-// Alternative version with fewer options
-const getDirectionsSimple = async (start, end, profile = 'driving-car') => {
   try {
-    const response = await orsClient.post(`/directions/${profile}`, {
-      coordinates: [start, end]
-      // Minimal parameters to avoid errors
-    });
-    
-    return {
-      distance: response.data.routes[0].summary.distance,
-      duration: response.data.routes[0].summary.duration,
-      geometry: response.data.routes[0].geometry,
-      steps: []
-    };
-  } catch (error) {
-    console.error('ORS Directions Error:', error.response?.data || error.message);
-    throw error;
+    return await getDirectionsFromOsrm(start, end);
+  } catch (osrmError) {
+    console.warn('OSRM directions failed, using straight-line fallback:', osrmError.response?.data || osrmError.message);
   }
+
+  return buildStraightLineRoute(start, end);
 };
 
-// Calculate fare
+const getDirectionsSimple = async (start, end, profile = 'driving-car') =>
+  getDirections(start, end, profile);
+
 const calculateFare = (distance, surgeMultiplier = 1.0) => {
   const baseFare = DEFAULT_PRICING.baseFare + DEFAULT_PRICING.bookingFee;
   const distanceFare = distance * DEFAULT_PRICING.perKm;
