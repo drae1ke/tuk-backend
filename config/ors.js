@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { DEFAULT_PRICING } = require('../utils/pricing');
 
 const orsConfig = {
   baseURL: process.env.ORS_BASE_URL || 'https://api.openrouteservice.org/v2',
@@ -80,16 +81,10 @@ const getDirectionsSimple = async (start, end, profile = 'driving-car') => {
 
 // Calculate fare
 const calculateFare = (distance, surgeMultiplier = 1.0) => {
-  // Kenyan tuk-tuk fare structure
-  const BASE_FARE = 50; // KES
-  const PER_KM_RATE = 30; // KES per km
-  const MIN_FARE = 100; // KES
-  
-  let fare = BASE_FARE + (distance * PER_KM_RATE);
-  fare = Math.max(fare, MIN_FARE);
-  fare = fare * surgeMultiplier;
-  
-  return Math.ceil(fare);
+  const baseFare = DEFAULT_PRICING.baseFare + DEFAULT_PRICING.bookingFee;
+  const distanceFare = distance * DEFAULT_PRICING.perKm;
+  const fare = Math.max(baseFare + distanceFare, DEFAULT_PRICING.minimumFare) * surgeMultiplier;
+  return Math.ceil(fare / 10) * 10;
 };
 
 module.exports = {

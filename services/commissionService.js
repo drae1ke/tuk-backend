@@ -1,3 +1,20 @@
+/**
+ * services/commissionService.js
+ *
+ * All commission lifecycle logic:
+ *   recordRideCommission        → accrue after a completed ride
+ *   runWeeklySettlement         → Sunday 23:59 — finalize totals, set due amounts
+ *   sendPaymentReminders        → Monday 08:00 — remind drivers
+ *   sendGraceWarnings           → Following Sunday 08:00 — final warning
+ *   restrictOverdueDrivers      → Following Monday 00:00 — cut off late-payers
+ *   initiateCommissionPayment   → STK Push trigger (manual or system)
+ *   handleCommissionPaymentCallback → M-Pesa callback handler
+ *   getDriverCommissionSnapshot → full dashboard state for a driver
+ *   refreshDriverCommissionState → sync Driver doc fields from Commission truth
+ */
+
+'use strict';
+
 const crypto = require('crypto');
 const Commission = require('../models/Commission');
 const Driver = require('../models/Driver');
@@ -5,188 +22,167 @@ const PaymentTransaction = require('../models/PaymentTransaction');
 const Ride = require('../models/Ride');
 const logger = require('../utils/logger');
 const { sendEmail } = require('../utils/emailService');
+const { initiateStkPush } = require('./mpesaService');
 const {
   DEFAULT_TIMEZONE,
   getCountdownMs,
   getGraceDeadlineForWeek,
   getPreviousWeekWindow,
+  getWeekWindow,
   getWeekRelativeDate,
-  getWeekWindow
 } = require('../utils/businessTime');
-const { initiateStkPush } = require('./mpesaService');
 
-const COMMISSION_RATE = Number(process.env.COMMISSION_RATE || 0.1);
-const STK_RETRY_WINDOW_MS = Number(process.env.MPESA_STK_RETRY_WINDOW_MS || 120000);
+// ── Constants ─────────────────────────────────────────────────────────────────
+const COMMISSION_RATE = Number(process.env.COMMISSION_RATE || 0.10);
+// How long (ms) to consider an STK Push still "pending" before allowing retry
+const STK_RETRY_WINDOW_MS = Number(process.env.MPESA_STK_RETRY_WINDOW_MS || 120_000);
 
-const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+// ── Currency helpers ──────────────────────────────────────────────────────────
+const roundCurrency = (v) => Math.round((Number(v) + Number.EPSILON) * 100) / 100;
 
-const calculateRideCommission = (fare) => roundCurrency(Number(fare || 0) * COMMISSION_RATE);
+const calculateRideCommission = (fare) =>
+  roundCurrency(Number(fare || 0) * COMMISSION_RATE);
 
-const getCommissionTargetAmount = (commission) => (
-  roundCurrency(
-    commission?.dueAmount && Number(commission.dueAmount) > 0
+/** Amount the driver still owes on a single Commission record */
+const getCommissionPayableAmount = (commission) => {
+  if (!commission) return 0;
+  const target = roundCurrency(
+    Number(commission.dueAmount) > 0
       ? commission.dueAmount
-      : commission?.amount || 0
-  )
-);
-
-const getCommissionPayableAmount = (commission) => (
-  roundCurrency(Math.max(getCommissionTargetAmount(commission) - Number(commission?.paidAmount || 0), 0))
-);
-
-const canDriverReceiveRequests = (driver) => (
-  Boolean(driver) &&
-  driver.status === 'active' &&
-  driver.commissionAccountStatus === 'active' &&
-  driver.online &&
-  driver.available
-);
-
-const recordNotification = async (commissions, type, channel, metadata = {}) => {
-  if (!commissions.length) {
-    return;
-  }
-
-  await Commission.updateMany(
-    { _id: { $in: commissions.map((commission) => commission._id) } },
-    {
-      $push: {
-        notifications: {
-          type,
-          channel,
-          metadata,
-          sentAt: new Date()
-        }
-      },
-      ...(type === 'reminder' ? { $set: { lastReminderAt: new Date() } } : {})
-    }
+      : commission.amount || 0
   );
+  return roundCurrency(Math.max(target - Number(commission.paidAmount || 0), 0));
 };
 
-const sendDriverNotification = async ({ driver, commissions, type, subject, body }) => {
+// ── Notification helper ───────────────────────────────────────────────────────
+const _sendDriverNotification = async ({ driver, commissions = [], type, subject, body }) => {
   let channel = 'log';
+  const emailConfigured =
+    driver?.email &&
+    process.env.EMAIL_HOST &&
+    process.env.EMAIL_USER &&
+    process.env.EMAIL_PASS;
 
-  if (driver?.email && process.env.EMAIL_HOST && process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+  if (emailConfigured) {
     try {
-      await sendEmail(
-        driver.email,
-        subject,
-        `<p>${body}</p>`
-      );
+      await sendEmail(driver.email, subject, `<p>${body}</p>`);
       channel = 'email';
-    } catch (error) {
-      logger.warn(`Commission notification email failed for driver ${driver._id}: ${error.message}`);
+    } catch (err) {
+      logger.warn(`Notification email failed for driver ${driver._id}: ${err.message}`);
     }
   }
 
-  logger.info({
-    event: 'commission.notification',
-    driverId: driver?._id?.toString(),
-    type,
-    subject,
-    body
-  });
+  logger.info({ event: 'commission.notification', driverId: driver?._id, type, subject });
 
-  await recordNotification(commissions, type, channel, { subject, body });
+  if (commissions.length) {
+    await Commission.updateMany(
+      { _id: { $in: commissions.map((c) => c._id) } },
+      {
+        $push: { notifications: { type, channel, sentAt: new Date(), metadata: { subject, body } } },
+        ...(type === 'reminder' ? { $set: { lastReminderAt: new Date() } } : {}),
+      }
+    );
+  }
 };
 
-const getDriverOutstandingCommissions = async (driverId) => (
-  Commission.find({
-    driverId,
-    status: { $in: ['pending', 'overdue'] },
-    outstandingAmount: { $gt: 0 }
-  }).sort({ weekStart: 1 })
-);
-
-const getDriverPayableCommissions = async (driverId) => {
-  const commissions = await Commission.find({
-    driverId,
-    status: { $in: ['accruing', 'pending', 'overdue'] }
-  }).sort({ weekStart: 1 });
-
-  return commissions.filter((commission) => getCommissionPayableAmount(commission) > 0);
-};
-
-const refreshDriverCommissionState = async (driverId, options = {}) => {
-  const now = options.now || new Date();
-  const { weekStart } = getWeekWindow(now, DEFAULT_TIMEZONE);
+// ── Driver state refresh ──────────────────────────────────────────────────────
+/**
+ * Re-derives Driver document fields (balances, status, restriction) from
+ * the ground-truth Commission collection.  Call this after any mutation.
+ */
+const refreshDriverCommissionState = async (driverId, { now = new Date() } = {}) => {
+  const { weekStart, weekEnd } = getWeekWindow(now, DEFAULT_TIMEZONE);
 
   const [driver, currentWeekCommission, outstandingCommissions] = await Promise.all([
     Driver.findById(driverId),
-    Commission.findOne({
+    Commission.findOne({ driverId, weekStart, status: 'accruing' }),
+    Commission.find({
       driverId,
-      weekStart,
-      status: 'accruing'
-    }),
-    getDriverOutstandingCommissions(driverId)
+      status: { $in: ['pending', 'overdue'] },
+      outstandingAmount: { $gt: 0 },
+    }).sort({ weekStart: 1 }),
   ]);
 
-  if (!driver) {
-    return null;
-  }
+  if (!driver) return null;
 
   const outstandingCommissionBalance = roundCurrency(
-    outstandingCommissions.reduce((sum, commission) => sum + Number(commission.outstandingAmount || 0), 0)
+    outstandingCommissions.reduce((s, c) => s + Number(c.outstandingAmount || 0), 0)
   );
 
-  const shouldRestrict = outstandingCommissions.some((commission) => (
-    commission.graceEndsAt && commission.graceEndsAt.getTime() < now.getTime()
-  ));
+  // Restricted if any outstanding commission has passed its grace deadline
+  const shouldRestrict = outstandingCommissions.some(
+    (c) => c.graceEndsAt && new Date(c.graceEndsAt) < now
+  );
 
-  const earliestGraceDeadline = outstandingCommissions
-    .map((commission) => commission.graceEndsAt)
+  const earliestGrace = outstandingCommissions
+    .map((c) => c.graceEndsAt)
     .filter(Boolean)
     .sort((a, b) => a.getTime() - b.getTime())[0] || null;
 
-  const nextAvailability = shouldRestrict
-    ? false
-    : Boolean(driver.status === 'active' && driver.online && !driver.currentRide && driver.commissionAccountStatus === 'restricted');
+  const canBeAvailable =
+    driver.status === 'active' &&
+    driver.online &&
+    !driver.currentRide &&
+    !shouldRestrict;
 
   const updates = {
     weeklyCommissionBalance: roundCurrency(currentWeekCommission?.amount || 0),
     currentCommissionWeekStart: weekStart,
-    currentCommissionWeekEnd: getWeekWindow(now, DEFAULT_TIMEZONE).weekEnd,
+    currentCommissionWeekEnd: weekEnd,
     outstandingCommissionBalance,
-    commissionGraceEndsAt: earliestGraceDeadline,
+    commissionGraceEndsAt: earliestGrace,
     commissionAccountStatus: shouldRestrict ? 'restricted' : 'active',
-    restrictionReason: shouldRestrict ? 'Outstanding weekly commission was not paid before the grace deadline' : null
+    restrictionReason: shouldRestrict
+      ? 'Unpaid weekly remittance is more than 7 days overdue'
+      : null,
+    available: canBeAvailable,
   };
 
-  if (shouldRestrict) {
-    updates.available = false;
-  } else if (nextAvailability) {
-    updates.available = true;
-  }
-
-  await Driver.findByIdAndUpdate(driverId, updates, { new: true });
-
-  return {
-    ...updates,
-    canReceiveRideRequests: canDriverReceiveRequests({
-      ...driver.toObject(),
-      ...updates,
-      available: updates.available !== undefined ? updates.available : driver.available
-    })
-  };
+  await Driver.findByIdAndUpdate(driverId, updates);
+  return { ...updates, canReceiveRideRequests: !shouldRestrict && driver.status === 'active' };
 };
 
+// ── Ride commission accrual ───────────────────────────────────────────────────
+/**
+ * Called immediately after a ride is marked `completed`.
+ * Idempotent: uses commissionProcessedAt field to prevent double-counting.
+ */
 const recordRideCommission = async (ride) => {
+  console.log('[Commission] recordRideCommission called:', { 
+    rideId: ride?._id, 
+    driverId: ride?.driverId, 
+    status: ride?.status,
+    fare: ride?.fare 
+  });
+  
   if (!ride?.driverId || ride.status !== 'completed') {
-    return { skipped: true, reason: 'ride-not-eligible' };
+    console.log('[Commission] Skipped: not eligible', { reason: 'not-eligible' });
+    return { skipped: true, reason: 'not-eligible' };
   }
 
   const completedAt = ride.completedAt ? new Date(ride.completedAt) : new Date();
   const { weekStart, weekEnd } = getWeekWindow(completedAt, DEFAULT_TIMEZONE);
   const commissionAmount = calculateRideCommission(ride.fare);
   const grossFare = roundCurrency(ride.fare);
+  
+  console.log('[Commission] Processing ride:', {
+    rideId: ride._id,
+    driverId: ride.driverId,
+    fare: ride.fare,
+    commissionAmount,
+    grossFare,
+    weekStart,
+    weekEnd
+  });
 
-  const updatedRide = await Ride.findOneAndUpdate(
+  // Atomic idempotency guard
+  const updated = await Ride.findOneAndUpdate(
     {
       _id: ride._id,
       $or: [
         { commissionProcessedAt: { $exists: false } },
-        { commissionProcessedAt: null }
-      ]
+        { commissionProcessedAt: null },
+      ],
     },
     {
       $set: {
@@ -194,16 +190,15 @@ const recordRideCommission = async (ride) => {
         commissionRate: COMMISSION_RATE,
         commissionWeekStart: weekStart,
         commissionWeekEnd: weekEnd,
-        commissionProcessedAt: new Date()
-      }
+        commissionProcessedAt: new Date(),
+      },
     },
     { new: true }
   );
 
-  if (!updatedRide) {
-    return { skipped: true, reason: 'already-processed' };
-  }
+  if (!updated) return { skipped: true, reason: 'already-processed' };
 
+  // Upsert the commission bucket for this driver-week
   await Commission.findOneAndUpdate(
     { driverId: ride.driverId, weekStart },
     {
@@ -218,77 +213,81 @@ const recordRideCommission = async (ride) => {
         grossFares: 0,
         rideCount: 0,
         currency: 'KES',
-        status: 'accruing'
+        status: 'accruing',
+        notifications: [],
       },
-      $inc: {
-        amount: commissionAmount,
-        grossFares: grossFare,
-        rideCount: 1
-      },
-      $addToSet: {
-        rideIds: ride._id
-      },
+      $inc: { amount: commissionAmount, grossFares: grossFare, rideCount: 1 },
+      $addToSet: { rideIds: ride._id },
       $push: {
         lineItems: {
           rideId: ride._id,
           fare: grossFare,
           commissionAmount,
-          completedAt
-        }
-      }
+          completedAt,
+        },
+      },
     },
     { upsert: true }
   );
 
   await refreshDriverCommissionState(ride.driverId, { now: completedAt });
 
-  return {
-    commissionAmount,
-    weekStart,
-    weekEnd
-  };
+  return { commissionAmount, weekStart, weekEnd };
 };
 
+// ── Weekly settlement ─────────────────────────────────────────────────────────
+/**
+ * Run at Sunday 23:59.
+ * Reads all completed rides for the target week, (re-)builds Commission totals,
+ * sets dueAmount / graceEndsAt, transitions status from 'accruing' → 'pending'.
+ */
 const runWeeklySettlement = async ({
   referenceDate = new Date(),
   targetWeekStart = null,
-  triggeredBy = 'scheduler'
+  triggeredBy = 'scheduler',
 } = {}) => {
   const targetWindow = targetWeekStart
     ? getWeekWindow(new Date(targetWeekStart), DEFAULT_TIMEZONE)
     : getPreviousWeekWindow(referenceDate, DEFAULT_TIMEZONE);
+
   const now = new Date();
   const graceEndsAt = getGraceDeadlineForWeek(targetWindow.weekStart, DEFAULT_TIMEZONE);
 
+  // Aggregate rides for the week
   const rides = await Ride.find({
     driverId: { $ne: null },
     status: 'completed',
-    completedAt: { $gte: targetWindow.weekStart, $lte: targetWindow.weekEnd }
-  }).select('_id driverId fare completedAt commissionAmount').lean();
+    completedAt: { $gte: targetWindow.weekStart, $lte: targetWindow.weekEnd },
+  })
+    .select('_id driverId fare completedAt commissionAmount')
+    .lean();
 
+  // Group by driver
   const grouped = new Map();
-  const missingCommissionUpdates = [];
+  const rideUpdates = [];
 
   for (const ride of rides) {
     const driverId = ride.driverId.toString();
     const commissionAmount = roundCurrency(
-      ride.commissionAmount != null ? ride.commissionAmount : calculateRideCommission(ride.fare)
+      ride.commissionAmount != null
+        ? ride.commissionAmount
+        : calculateRideCommission(ride.fare)
     );
 
     if (ride.commissionAmount == null) {
-      missingCommissionUpdates.push({
+      rideUpdates.push({
         updateOne: {
-          filter: { _id: ride._id },
+          filter: { _id: ride._id, commissionProcessedAt: null },
           update: {
             $set: {
               commissionAmount,
               commissionRate: COMMISSION_RATE,
               commissionWeekStart: targetWindow.weekStart,
               commissionWeekEnd: targetWindow.weekEnd,
-              commissionProcessedAt: new Date()
-            }
-          }
-        }
+              commissionProcessedAt: now,
+            },
+          },
+        },
       });
     }
 
@@ -299,415 +298,125 @@ const runWeeklySettlement = async ({
         grossFares: 0,
         rideCount: 0,
         rideIds: [],
-        lineItems: []
+        lineItems: [],
       });
     }
 
-    const summary = grouped.get(driverId);
-    summary.amount = roundCurrency(summary.amount + commissionAmount);
-    summary.grossFares = roundCurrency(summary.grossFares + roundCurrency(ride.fare));
-    summary.rideCount += 1;
-    summary.rideIds.push(ride._id);
-    summary.lineItems.push({
+    const g = grouped.get(driverId);
+    g.amount = roundCurrency(g.amount + commissionAmount);
+    g.grossFares = roundCurrency(g.grossFares + roundCurrency(ride.fare));
+    g.rideCount += 1;
+    g.rideIds.push(ride._id);
+    g.lineItems.push({
       rideId: ride._id,
       fare: roundCurrency(ride.fare),
       commissionAmount,
-      completedAt: ride.completedAt
+      completedAt: ride.completedAt,
     });
   }
 
-  if (missingCommissionUpdates.length) {
-    await Ride.bulkWrite(missingCommissionUpdates);
-  }
+  if (rideUpdates.length) await Ride.bulkWrite(rideUpdates);
 
   const affectedDriverIds = [];
   const settledCommissions = [];
 
-  for (const summary of grouped.values()) {
-    const commission = await Commission.findOne({
-      driverId: summary.driverId,
-      weekStart: targetWindow.weekStart
+  for (const g of grouped.values()) {
+    const existing = await Commission.findOne({
+      driverId: g.driverId,
+      weekStart: targetWindow.weekStart,
     });
 
-    const paidAmount = roundCurrency(commission?.paidAmount || 0);
-    const outstandingAmount = roundCurrency(Math.max(summary.amount - paidAmount, 0));
+    const paidAmount = roundCurrency(existing?.paidAmount || 0);
+    const outstandingAmount = roundCurrency(Math.max(g.amount - paidAmount, 0));
+
+    const status =
+      outstandingAmount <= 0
+        ? 'paid'
+        : now > graceEndsAt
+        ? 'overdue'
+        : 'pending';
 
     const payload = {
-      driverId: summary.driverId,
+      driverId: g.driverId,
       weekStart: targetWindow.weekStart,
       weekEnd: targetWindow.weekEnd,
-      amount: summary.amount,
-      dueAmount: summary.amount,
+      amount: g.amount,
+      dueAmount: g.amount,
       paidAmount,
       outstandingAmount,
-      grossFares: summary.grossFares,
-      rideCount: summary.rideCount,
-      rideIds: summary.rideIds,
-      lineItems: summary.lineItems,
+      grossFares: g.grossFares,
+      rideCount: g.rideCount,
+      rideIds: g.rideIds,
+      lineItems: g.lineItems,
       currency: 'KES',
-      settledAt: commission?.settledAt || now,
+      status,
+      settledAt: existing?.settledAt || now,
       dueAt: graceEndsAt,
       graceEndsAt,
+      paidAt: status === 'paid' ? (existing?.paidAt || now) : existing?.paidAt,
       metadata: {
-        ...(commission?.metadata || {}),
+        ...(existing?.metadata || {}),
         lastSettledBy: triggeredBy,
-        lastSettledAt: now
-      }
+        lastSettledAt: now,
+      },
     };
 
-    if (outstandingAmount <= 0) {
-      payload.status = 'paid';
-      payload.paidAt = commission?.paidAt || now;
-    } else {
-      payload.status = now > graceEndsAt ? 'overdue' : 'pending';
-      payload.paidAt = commission?.paidAt || undefined;
-    }
-
-    const updated = await Commission.findOneAndUpdate(
-      { driverId: summary.driverId, weekStart: targetWindow.weekStart },
+    const commission = await Commission.findOneAndUpdate(
+      { driverId: g.driverId, weekStart: targetWindow.weekStart },
       { $set: payload, $setOnInsert: { notifications: [] } },
-      { new: true, upsert: true }
+      { upsert: true, new: true }
     );
 
-    settledCommissions.push(updated);
-    affectedDriverIds.push(summary.driverId.toString());
+    settledCommissions.push(commission);
+    affectedDriverIds.push(g.driverId.toString());
   }
 
-  const drivers = await Driver.find({ _id: { $in: affectedDriverIds } });
-
+  // Notify drivers with outstanding balances
+  const drivers = await Driver.find({ _id: { $in: affectedDriverIds } }).lean();
   for (const driver of drivers) {
-    const driverCommissions = settledCommissions.filter((commission) => (
-      commission.driverId.toString() === driver._id.toString() && commission.outstandingAmount > 0
-    ));
+    const driverCommissions = settledCommissions.filter(
+      (c) =>
+        c.driverId.toString() === driver._id.toString() && c.outstandingAmount > 0
+    );
+    if (!driverCommissions.length) continue;
 
-    if (driverCommissions.length) {
-      const totalDue = roundCurrency(
-        driverCommissions.reduce((sum, commission) => sum + Number(commission.outstandingAmount || 0), 0)
-      );
+    const totalDue = roundCurrency(
+      driverCommissions.reduce((s, c) => s + Number(c.outstandingAmount || 0), 0)
+    );
 
-      await sendDriverNotification({
-        driver,
-        commissions: driverCommissions,
-        type: 'summary',
-        subject: 'Weekly commission summary',
-        body: `Your commission for ${targetWindow.weekKey} is KES ${totalDue}. Please pay by ${graceEndsAt.toISOString()}.`
-      });
-    }
+    await _sendDriverNotification({
+      driver,
+      commissions: driverCommissions,
+      type: 'summary',
+      subject: `TookRide: Your weekly commission — KES ${totalDue}`,
+      body: `Your commission for the week of ${targetWindow.weekKey} is <strong>KES ${totalDue}</strong>. Please pay by ${graceEndsAt.toDateString()} to keep your account active.`,
+    });
   }
 
-  await Promise.all(affectedDriverIds.map((driverId) => refreshDriverCommissionState(driverId)));
+  // Refresh all driver documents
+  await Promise.all(affectedDriverIds.map((id) => refreshDriverCommissionState(id)));
+
+  logger.info({
+    event: 'commission.settlement',
+    weekKey: targetWindow.weekKey,
+    driversSettled: affectedDriverIds.length,
+    totalCommission: roundCurrency(
+      settledCommissions.reduce((s, c) => s + Number(c.dueAmount || 0), 0)
+    ),
+    triggeredBy,
+  });
 
   return {
     weekStart: targetWindow.weekStart,
     weekEnd: targetWindow.weekEnd,
     driversSettled: affectedDriverIds.length,
     totalCommission: roundCurrency(
-      settledCommissions.reduce((sum, commission) => sum + Number(commission.dueAmount || 0), 0)
-    )
-  };
-};
-
-const buildAccountReference = (driverId, commissions) => {
-  const oldestWeek = commissions[0]?.weekStart
-    ? new Date(commissions[0].weekStart).toISOString().slice(2, 10).replace(/-/g, '')
-    : 'COMM';
-
-  return `TR${oldestWeek}${driverId.toString().slice(-4)}`;
-};
-
-const initiateCommissionPayment = async ({
-  driverId,
-  requestSource = 'driver',
-  idempotencyKey = null
-}) => {
-  const [driver, commissions] = await Promise.all([
-    Driver.findById(driverId),
-    getDriverPayableCommissions(driverId)
-  ]);
-
-  if (!driver) {
-    throw new Error('Driver not found');
-  }
-
-  if (!commissions.length) {
-    throw new Error('No accrued commission balance to pay');
-  }
-
-  const totalPayable = roundCurrency(
-    commissions.reduce((sum, commission) => sum + getCommissionPayableAmount(commission), 0)
-  );
-  const phoneNumber = driver.mpesaNumber || driver.phone;
-
-  if (!phoneNumber) {
-    throw new Error('Driver does not have a registered M-Pesa number');
-  }
-
-  if (idempotencyKey) {
-    const existingByKey = await PaymentTransaction.findOne({ idempotencyKey });
-    if (existingByKey) {
-      return { transaction: existingByKey, reused: true };
-    }
-  }
-
-  const existingPendingTransaction = await PaymentTransaction.findOne({
-    driverId,
-    status: { $in: ['initiated', 'pending_callback'] },
-    createdAt: { $gte: new Date(Date.now() - STK_RETRY_WINDOW_MS) }
-  }).sort({ createdAt: -1 });
-
-  if (existingPendingTransaction) {
-    return { transaction: existingPendingTransaction, reused: true };
-  }
-
-  const transaction = await PaymentTransaction.create({
-    driverId,
-    commissionIds: commissions.map((commission) => commission._id),
-    amount: totalPayable,
-    phoneNumber,
-    requestSource,
-    status: 'initiated',
-    idempotencyKey: idempotencyKey || `comm_${Date.now()}_${crypto.randomUUID()}`,
-    allocation: commissions.map((commission) => ({
-      commissionId: commission._id,
-      weekStart: commission.weekStart,
-      weekEnd: commission.weekEnd,
-      amount: getCommissionPayableAmount(commission)
-    }))
-  });
-
-  try {
-    const mpesaResponse = await initiateStkPush({
-      phoneNumber,
-      amount: totalPayable,
-      accountReference: buildAccountReference(driverId, commissions),
-      description: 'Driver commission',
-      transactionId: transaction._id.toString()
-    });
-
-    transaction.status = 'pending_callback';
-    transaction.phoneNumber = mpesaResponse.normalizedPhone;
-    transaction.requestPayload = mpesaResponse.requestPayload;
-    transaction.responsePayload = mpesaResponse.responsePayload;
-    transaction.merchantRequestId = mpesaResponse.responsePayload.MerchantRequestID;
-    transaction.checkoutRequestId = mpesaResponse.responsePayload.CheckoutRequestID;
-    await transaction.save();
-
-    return { transaction, reused: false };
-  } catch (error) {
-    transaction.status = 'failed';
-    transaction.failureReason = error.response?.data?.errorMessage || error.message;
-    transaction.responsePayload = error.response?.data || null;
-    await transaction.save();
-
-    await sendDriverNotification({
-      driver,
-      commissions,
-      type: 'payment_failure',
-      subject: 'Commission payment failed',
-      body: `We could not start your M-Pesa STK Push. Reason: ${transaction.failureReason}`
-    });
-
-    throw error;
-  }
-};
-
-const applyPaymentAllocation = async (transaction, paidAmount) => {
-  const commissions = await Commission.find({
-    _id: { $in: transaction.commissionIds }
-  }).sort({ weekStart: 1 });
-
-  let remaining = roundCurrency(paidAmount);
-  const allocations = [];
-
-  for (const commission of commissions) {
-    const payableAmount = getCommissionPayableAmount(commission);
-
-    if (remaining <= 0 || payableAmount <= 0) {
-      allocations.push({
-        commissionId: commission._id,
-        weekStart: commission.weekStart,
-        weekEnd: commission.weekEnd,
-        amount: 0
-      });
-      continue;
-    }
-
-    const appliedAmount = roundCurrency(Math.min(payableAmount, remaining));
-    commission.paidAmount = roundCurrency(commission.paidAmount + appliedAmount);
-    commission.outstandingAmount = roundCurrency(Math.max(getCommissionTargetAmount(commission) - commission.paidAmount, 0));
-
-    if (commission.status === 'accruing' && (!commission.dueAmount || Number(commission.dueAmount) === 0)) {
-      commission.status = 'accruing';
-      if (commission.outstandingAmount === 0) {
-        commission.paidAt = null;
-      }
-    } else {
-      commission.status = commission.outstandingAmount > 0
-        ? (new Date() > commission.graceEndsAt ? 'overdue' : 'pending')
-        : 'paid';
-
-      if (commission.status === 'paid') {
-        commission.paidAt = new Date();
-      }
-    }
-
-    await commission.save();
-
-    allocations.push({
-      commissionId: commission._id,
-      weekStart: commission.weekStart,
-      weekEnd: commission.weekEnd,
-      amount: appliedAmount
-    });
-
-    remaining = roundCurrency(remaining - appliedAmount);
-  }
-
-  transaction.allocation = allocations;
-  return { allocations, remaining };
-};
-
-const handleCommissionPaymentCallback = async (callback) => {
-  const transaction = await PaymentTransaction.findOne({
-    checkoutRequestId: callback.checkoutRequestId
-  });
-
-  if (!transaction) {
-    logger.warn(`M-Pesa callback received for unknown checkout request ${callback.checkoutRequestId}`);
-    return { handled: false, reason: 'not-found' };
-  }
-
-  if (['succeeded', 'failed', 'partially_allocated'].includes(transaction.status)) {
-    return { handled: true, transaction, duplicate: true };
-  }
-
-  transaction.callbackPayload = callback.raw;
-  transaction.resultCode = callback.resultCode;
-  transaction.resultDesc = callback.resultDesc;
-  transaction.callbackReceivedAt = new Date();
-
-  const driver = await Driver.findById(transaction.driverId);
-  const commissions = await Commission.find({ _id: { $in: transaction.commissionIds } });
-
-  if (callback.resultCode === 0) {
-    const paidAmount = roundCurrency(callback.metadata.Amount || transaction.amount);
-    transaction.mpesaReceipt = callback.metadata.MpesaReceiptNumber;
-    transaction.completedAt = new Date();
-    transaction.status = 'succeeded';
-
-    const { remaining } = await applyPaymentAllocation(transaction, paidAmount);
-    if (remaining > 0) {
-      transaction.status = 'partially_allocated';
-    }
-
-    await transaction.save();
-
-    if (driver) {
-      driver.lastPaymentDate = new Date();
-      await driver.save();
-      await refreshDriverCommissionState(driver._id);
-    }
-
-    await sendDriverNotification({
-      driver,
-      commissions,
-      type: 'payment_success',
-      subject: 'Commission payment received',
-      body: `Your M-Pesa payment of KES ${paidAmount} was received successfully.`
-    });
-
-    return { handled: true, transaction };
-  }
-
-  transaction.status = 'failed';
-  transaction.failureReason = callback.resultDesc;
-  await transaction.save();
-
-  await sendDriverNotification({
-    driver,
-    commissions,
-    type: 'payment_failure',
-    subject: 'Commission payment failed',
-    body: `Your M-Pesa payment was not completed. Reason: ${callback.resultDesc}`
-  });
-
-  return { handled: true, transaction };
-};
-
-const getDriverCommissionSnapshot = async (driverId) => {
-  const now = new Date();
-  const { weekStart, weekEnd } = getWeekWindow(now, DEFAULT_TIMEZONE);
-
-  const [driver, currentWeekCommission, outstandingCommissions, payableCommissions, recentTransactions] = await Promise.all([
-    Driver.findById(driverId).lean(),
-    Commission.findOne({ driverId, weekStart, status: 'accruing' }).lean(),
-    Commission.find({
-      driverId,
-      status: { $in: ['pending', 'overdue'] },
-      outstandingAmount: { $gt: 0 }
-    }).sort({ weekStart: 1 }).lean(),
-    Commission.find({
-      driverId,
-      status: { $in: ['accruing', 'pending', 'overdue'] }
-    }).sort({ weekStart: 1 }).lean(),
-    PaymentTransaction.find({ driverId }).sort({ createdAt: -1 }).limit(5).lean()
-  ]);
-
-  if (!driver) {
-    throw new Error('Driver not found');
-  }
-
-  const totalDue = roundCurrency(
-    outstandingCommissions.reduce((sum, commission) => sum + Number(commission.outstandingAmount || 0), 0)
-  );
-  const payableNow = roundCurrency(
-    payableCommissions.reduce((sum, commission) => sum + getCommissionPayableAmount(commission), 0)
-  );
-  const currentWeekPayable = roundCurrency(getCommissionPayableAmount(currentWeekCommission));
-  const nextDeadline = outstandingCommissions
-    .map((commission) => commission.graceEndsAt)
-    .filter(Boolean)
-    .sort((a, b) => new Date(a).getTime() - new Date(b).getTime())[0] || null;
-
-  return {
-    accountStatus: driver.commissionAccountStatus || 'active',
-    onboardingStatus: driver.status,
-    canReceiveRideRequests: Boolean(
-      driver.status === 'active' &&
-      (driver.commissionAccountStatus || 'active') === 'active' &&
-      driver.online &&
-      driver.available
+      settledCommissions.reduce((s, c) => s + Number(c.dueAmount || 0), 0)
     ),
-    currentWeek: {
-      weekStart,
-      weekEnd,
-      accruedAmount: roundCurrency(currentWeekCommission?.amount || 0),
-      paidAmount: roundCurrency(currentWeekCommission?.paidAmount || 0),
-      payableNow: currentWeekPayable,
-      rideCount: currentWeekCommission?.rideCount || 0
-    },
-    payableNow,
-    outstanding: {
-      totalDue,
-      commissionCount: outstandingCommissions.length,
-      graceEndsAt: nextDeadline,
-      countdownMs: getCountdownMs(nextDeadline),
-      commissions: outstandingCommissions.map((commission) => ({
-        id: commission._id,
-        amount: commission.amount,
-        dueAmount: commission.dueAmount,
-        outstandingAmount: commission.outstandingAmount,
-        weekStart: commission.weekStart,
-        weekEnd: commission.weekEnd,
-        status: commission.status
-      }))
-    },
-    lastPaymentDate: driver.lastPaymentDate || null,
-    latestTransaction: recentTransactions[0] || null,
-    recentTransactions
   };
 };
 
+// ── Reminder jobs ─────────────────────────────────────────────────────────────
 const sendPaymentReminders = async ({ targetWeekStart = null } = {}) => {
   const referenceWindow = targetWeekStart
     ? getWeekWindow(new Date(targetWeekStart), DEFAULT_TIMEZONE)
@@ -716,45 +425,40 @@ const sendPaymentReminders = async ({ targetWeekStart = null } = {}) => {
   const commissions = await Commission.find({
     status: { $in: ['pending', 'overdue'] },
     outstandingAmount: { $gt: 0 },
-    weekStart: { $lte: referenceWindow.weekStart }
+    weekStart: { $lte: referenceWindow.weekStart },
   }).populate('driverId');
 
   const byDriver = new Map();
-
-  for (const commission of commissions) {
-    const key = commission.driverId._id.toString();
-    if (!byDriver.has(key)) {
-      byDriver.set(key, { driver: commission.driverId, commissions: [] });
-    }
-    byDriver.get(key).commissions.push(commission);
+  for (const c of commissions) {
+    const key = c.driverId._id.toString();
+    if (!byDriver.has(key)) byDriver.set(key, { driver: c.driverId, commissions: [] });
+    byDriver.get(key).commissions.push(c);
   }
 
   let remindersSent = 0;
-
-  for (const { driver, commissions: driverCommissions } of byDriver.values()) {
+  for (const { driver, commissions: dcs } of byDriver.values()) {
     const totalDue = roundCurrency(
-      driverCommissions.reduce((sum, commission) => sum + Number(commission.outstandingAmount || 0), 0)
+      dcs.reduce((s, c) => s + Number(c.outstandingAmount || 0), 0)
     );
+    const nearestDeadline = dcs
+      .map((c) => c.graceEndsAt)
+      .filter(Boolean)
+      .sort((a, b) => a.getTime() - b.getTime())[0];
 
-    await sendDriverNotification({
+    await _sendDriverNotification({
       driver,
-      commissions: driverCommissions,
+      commissions: dcs,
       type: 'reminder',
-      subject: 'Commission payment reminder',
-      body: `You have KES ${totalDue} due in commission payments. Please pay before ${driverCommissions[0].graceEndsAt.toISOString()}.`
+      subject: `TookRide: Pay KES ${totalDue} commission by ${nearestDeadline?.toDateString()}`,
+      body: `You owe <strong>KES ${totalDue}</strong> in platform commission. Log in to TookRide and tap <em>Pay Now</em> to avoid losing ride access.`,
     });
+    remindersSent++;
 
-    remindersSent += 1;
-
+    // Optional: trigger automated STK push on reminder day
     if (process.env.COMMISSION_AUTO_STK_PUSH === 'true') {
-      try {
-        await initiateCommissionPayment({
-          driverId: driver._id,
-          requestSource: 'system'
-        });
-      } catch (error) {
-        logger.warn(`Automatic commission STK push failed for ${driver._id}: ${error.message}`);
-      }
+      initiateCommissionPayment({ driverId: driver._id, requestSource: 'system' }).catch(
+        (err) => logger.warn(`Auto STK push failed for ${driver._id}: ${err.message}`)
+      );
     }
   }
 
@@ -769,39 +473,34 @@ const sendGraceWarnings = async ({ targetWeekStart = null } = {}) => {
   const commissions = await Commission.find({
     status: { $in: ['pending', 'overdue'] },
     outstandingAmount: { $gt: 0 },
-    weekStart: { $lte: referenceWindow.weekStart }
+    weekStart: { $lte: referenceWindow.weekStart },
   }).populate('driverId');
 
   const byDriver = new Map();
-
-  for (const commission of commissions) {
-    const key = commission.driverId._id.toString();
-    if (!byDriver.has(key)) {
-      byDriver.set(key, { driver: commission.driverId, commissions: [] });
-    }
-    byDriver.get(key).commissions.push(commission);
+  for (const c of commissions) {
+    const key = c.driverId._id.toString();
+    if (!byDriver.has(key)) byDriver.set(key, { driver: c.driverId, commissions: [] });
+    byDriver.get(key).commissions.push(c);
   }
 
   let warningsSent = 0;
-
-  for (const { driver, commissions: driverCommissions } of byDriver.values()) {
+  for (const { driver, commissions: dcs } of byDriver.values()) {
     const totalDue = roundCurrency(
-      driverCommissions.reduce((sum, commission) => sum + Number(commission.outstandingAmount || 0), 0)
+      dcs.reduce((s, c) => s + Number(c.outstandingAmount || 0), 0)
     );
-    const nearestDeadline = driverCommissions
-      .map((commission) => commission.graceEndsAt)
+    const nearestDeadline = dcs
+      .map((c) => c.graceEndsAt)
       .filter(Boolean)
       .sort((a, b) => a.getTime() - b.getTime())[0];
 
-    await sendDriverNotification({
+    await _sendDriverNotification({
       driver,
-      commissions: driverCommissions,
+      commissions: dcs,
       type: 'warning',
-      subject: 'Grace period warning',
-      body: `Your account will be restricted if the outstanding commission of KES ${totalDue} is not paid before ${nearestDeadline.toISOString()}.`
+      subject: `⚠️ TookRide: Last chance — KES ${totalDue} due TODAY`,
+      body: `Your grace period ends ${nearestDeadline?.toDateString()}. If you don't pay <strong>KES ${totalDue}</strong> before midnight, your account will be <strong>restricted</strong> and you will not receive new ride requests.`,
     });
-
-    warningsSent += 1;
+    warningsSent++;
   }
 
   return { warningsSent };
@@ -813,54 +512,350 @@ const restrictOverdueDrivers = async ({ referenceDate = new Date(), targetWeekSt
     : getPreviousWeekWindow(referenceDate, DEFAULT_TIMEZONE);
 
   const now = new Date();
-  const overdueCommissions = await Commission.find({
+  const overdue = await Commission.find({
     outstandingAmount: { $gt: 0 },
     graceEndsAt: { $lt: now },
-    weekStart: { $lte: targetWindow.weekStart }
+    weekStart: { $lte: targetWindow.weekStart },
   }).populate('driverId');
 
   const byDriver = new Map();
-
-  for (const commission of overdueCommissions) {
-    const key = commission.driverId._id.toString();
-    if (!byDriver.has(key)) {
-      byDriver.set(key, { driver: commission.driverId, commissions: [] });
-    }
-    byDriver.get(key).commissions.push(commission);
+  for (const c of overdue) {
+    const key = c.driverId._id.toString();
+    if (!byDriver.has(key)) byDriver.set(key, { driver: c.driverId, commissions: [] });
+    byDriver.get(key).commissions.push(c);
   }
 
   let restrictedDrivers = 0;
-
-  for (const { driver, commissions: driverCommissions } of byDriver.values()) {
-    for (const commission of driverCommissions) {
-      commission.status = 'overdue';
-      commission.restrictedAt = commission.restrictedAt || now;
-      await commission.save();
+  for (const { driver, commissions: dcs } of byDriver.values()) {
+    // Mark each commission overdue
+    for (const c of dcs) {
+      c.status = 'overdue';
+      c.restrictedAt = c.restrictedAt || now;
+      await c.save();
     }
 
     await refreshDriverCommissionState(driver._id, { now });
 
     const totalDue = roundCurrency(
-      driverCommissions.reduce((sum, commission) => sum + Number(commission.outstandingAmount || 0), 0)
+      dcs.reduce((s, c) => s + Number(c.outstandingAmount || 0), 0)
     );
 
-    await sendDriverNotification({
+    await _sendDriverNotification({
       driver,
-      commissions: driverCommissions,
+      commissions: dcs,
       type: 'restriction',
-      subject: 'Account restricted',
-      body: `Your driver account has been restricted because KES ${totalDue} in weekly commission remains unpaid.`
+      subject: '🚫 TookRide: Account restricted — pay commission to resume',
+      body: `Your account has been restricted because <strong>KES ${totalDue}</strong> in weekly commission was not paid before the grace period ended. Log in and pay to resume receiving ride requests.`,
     });
 
-    restrictedDrivers += 1;
+    restrictedDrivers++;
   }
 
+  logger.info({ event: 'commission.restriction', restrictedDrivers });
   return { restrictedDrivers };
+};
+
+// ── Payment initiation ────────────────────────────────────────────────────────
+const _buildAccountReference = (driverId, commissions) => {
+  const weekTag = commissions[0]?.weekStart
+    ? new Date(commissions[0].weekStart).toISOString().slice(2, 10).replace(/-/g, '')
+    : 'COMM';
+  return `TR${weekTag}${driverId.toString().slice(-4)}`;
+};
+
+/**
+ * Trigger STK Push for all payable (accruing + pending + overdue) commission.
+ * Idempotent: reuses any pending transaction within the retry window.
+ */
+const initiateCommissionPayment = async ({
+  driverId,
+  requestSource = 'driver',
+  idempotencyKey = null,
+}) => {
+  const [driver, payableCommissions] = await Promise.all([
+    Driver.findById(driverId),
+    Commission.find({
+      driverId,
+      status: { $in: ['accruing', 'pending', 'overdue'] },
+    })
+      .sort({ weekStart: 1 })
+      .then((cs) => cs.filter((c) => getCommissionPayableAmount(c) > 0)),
+  ]);
+
+  if (!driver) throw new Error('Driver not found');
+  if (!payableCommissions.length) throw new Error('No payable commission balance');
+
+  const totalPayable = roundCurrency(
+    payableCommissions.reduce((s, c) => s + getCommissionPayableAmount(c), 0)
+  );
+  const phoneNumber = driver.mpesaNumber || driver.phone;
+  if (!phoneNumber) throw new Error('Driver has no registered M-Pesa number');
+
+  // Idempotency by caller-supplied key
+  if (idempotencyKey) {
+    const byKey = await PaymentTransaction.findOne({ idempotencyKey });
+    if (byKey) return { transaction: byKey, reused: true };
+  }
+
+  // Idempotency by time window (prevent accidental double-sends)
+  const pending = await PaymentTransaction.findOne({
+    driverId,
+    status: { $in: ['initiated', 'pending_callback'] },
+    initiatedAt: { $gte: new Date(Date.now() - STK_RETRY_WINDOW_MS) },
+  }).sort({ initiatedAt: -1 });
+  if (pending) return { transaction: pending, reused: true };
+
+  const transaction = await PaymentTransaction.create({
+    driverId,
+    commissionIds: payableCommissions.map((c) => c._id),
+    amount: totalPayable,
+    phoneNumber,
+    requestSource,
+    status: 'initiated',
+    idempotencyKey: idempotencyKey || `comm_${Date.now()}_${crypto.randomUUID()}`,
+    allocation: payableCommissions.map((c) => ({
+      commissionId: c._id,
+      weekStart: c.weekStart,
+      weekEnd: c.weekEnd,
+      amount: getCommissionPayableAmount(c),
+    })),
+    initiatedAt: new Date(),
+  });
+
+  try {
+    const mpesa = await initiateStkPush({
+      phoneNumber,
+      amount: totalPayable,
+      accountReference: _buildAccountReference(driverId, payableCommissions),
+      description: 'TookRide comm',
+      transactionId: transaction._id.toString(),
+    });
+
+    transaction.status = 'pending_callback';
+    transaction.phoneNumber = mpesa.normalizedPhone;
+    transaction.requestPayload = mpesa.requestPayload;
+    transaction.responsePayload = mpesa.responsePayload;
+    transaction.merchantRequestId = mpesa.responsePayload.MerchantRequestID;
+    transaction.checkoutRequestId = mpesa.responsePayload.CheckoutRequestID;
+    await transaction.save();
+
+    return { transaction, reused: false };
+  } catch (error) {
+    transaction.status = 'failed';
+    transaction.failureReason =
+      error.darajaError?.errorMessage || error.message;
+    transaction.responsePayload = error.darajaError || null;
+    await transaction.save();
+
+    await _sendDriverNotification({
+      driver,
+      commissions: payableCommissions,
+      type: 'payment_failure',
+      subject: 'TookRide: Commission payment could not be initiated',
+      body: `We could not send the M-Pesa STK Push. Reason: <em>${transaction.failureReason}</em>. Please try again from your dashboard.`,
+    });
+
+    throw error;
+  }
+};
+
+// ── Payment callback handling ─────────────────────────────────────────────────
+/**
+ * Apply a successful payment proportionally across the driver's outstanding
+ * commission records (oldest first).
+ */
+const _applyPaymentAllocation = async (transaction, paidAmount) => {
+  const commissions = await Commission.find({
+    _id: { $in: transaction.commissionIds },
+  }).sort({ weekStart: 1 });
+
+  let remaining = roundCurrency(paidAmount);
+  for (const c of commissions) {
+    const payable = getCommissionPayableAmount(c);
+    if (remaining <= 0 || payable <= 0) continue;
+
+    const applied = roundCurrency(Math.min(payable, remaining));
+    const isAccruingCommission =
+      c.status === 'accruing' ||
+      (!c.graceEndsAt && Number(c.dueAmount || 0) <= 0);
+
+    c.paidAmount = roundCurrency(c.paidAmount + applied);
+    const remainingBalance = roundCurrency(
+      Math.max(
+        (Number(c.dueAmount) > 0 ? Number(c.dueAmount) : Number(c.amount)) - c.paidAmount,
+        0
+      )
+    );
+    c.outstandingAmount = isAccruingCommission ? 0 : remainingBalance;
+
+    const isFullyPaid = remainingBalance <= 0;
+    if (isAccruingCommission) {
+      c.status = 'accruing';
+      if (isFullyPaid) {
+        c.paidAt = new Date();
+      }
+    } else if (isFullyPaid) {
+      c.status = 'paid';
+      c.paidAt = new Date();
+    } else {
+      c.status = new Date() > c.graceEndsAt ? 'overdue' : 'pending';
+    }
+
+    await c.save();
+    remaining = roundCurrency(remaining - applied);
+  }
+
+  return { remaining };
+};
+
+const handleCommissionPaymentCallback = async (callback) => {
+  const transaction = await PaymentTransaction.findOne({
+    checkoutRequestId: callback.checkoutRequestId,
+  });
+
+  if (!transaction) {
+    logger.warn(`Callback received for unknown checkout: ${callback.checkoutRequestId}`);
+    return { handled: false, reason: 'not-found' };
+  }
+
+  // Skip if already terminal
+  if (['succeeded', 'failed', 'partially_allocated'].includes(transaction.status)) {
+    return { handled: true, transaction, duplicate: true };
+  }
+
+  transaction.callbackPayload = callback.raw;
+  transaction.resultCode = callback.resultCode;
+  transaction.resultDesc = callback.resultDesc;
+  transaction.callbackReceivedAt = new Date();
+
+  const driver = await Driver.findById(transaction.driverId);
+  const commissions = await Commission.find({ _id: { $in: transaction.commissionIds } });
+
+  if (callback.resultCode === 0) {
+    // SUCCESS
+    const paidAmount = roundCurrency(callback.metadata.Amount || transaction.amount);
+    transaction.mpesaReceipt = callback.metadata.MpesaReceiptNumber;
+    transaction.completedAt = new Date();
+    transaction.status = 'succeeded';
+
+    const { remaining } = await _applyPaymentAllocation(transaction, paidAmount);
+    if (remaining > 0) transaction.status = 'partially_allocated';
+    await transaction.save();
+
+    if (driver) {
+      driver.lastPaymentDate = new Date();
+      await driver.save();
+      await refreshDriverCommissionState(driver._id);
+    }
+
+    await _sendDriverNotification({
+      driver,
+      commissions,
+      type: 'payment_success',
+      subject: `✅ TookRide: KES ${paidAmount} commission payment received`,
+      body: `Your M-Pesa payment of <strong>KES ${paidAmount}</strong> (receipt: ${transaction.mpesaReceipt}) was received. Your account status has been updated.`,
+    });
+  } else {
+    // FAILURE
+    transaction.status = 'failed';
+    transaction.failureReason = callback.resultDesc;
+    await transaction.save();
+
+    await _sendDriverNotification({
+      driver,
+      commissions,
+      type: 'payment_failure',
+      subject: 'TookRide: M-Pesa payment was not completed',
+      body: `Your M-Pesa commission payment failed. Reason: <em>${callback.resultDesc}</em>. Please try again from your dashboard.`,
+    });
+  }
+
+  return { handled: true, transaction };
+};
+
+// ── Dashboard snapshot ────────────────────────────────────────────────────────
+const getDriverCommissionSnapshot = async (driverId) => {
+  const now = new Date();
+  const refreshedState = await refreshDriverCommissionState(driverId, { now });
+  const { weekStart, weekEnd } = getWeekWindow(now, DEFAULT_TIMEZONE);
+
+  const [driver, currentWeekCommission, outstandingCommissions, payableCommissions, recentTransactions] =
+    await Promise.all([
+      Driver.findById(driverId).lean(),
+      Commission.findOne({ driverId, weekStart, status: 'accruing' }).lean(),
+      Commission.find({
+        driverId,
+        status: { $in: ['pending', 'overdue'] },
+        outstandingAmount: { $gt: 0 },
+      })
+        .sort({ weekStart: 1 })
+        .lean(),
+      Commission.find({
+        driverId,
+        status: { $in: ['accruing', 'pending', 'overdue'] },
+      })
+        .sort({ weekStart: 1 })
+        .lean(),
+      PaymentTransaction.find({ driverId })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean(),
+    ]);
+
+  if (!driver) throw new Error('Driver not found');
+
+  const totalDue = roundCurrency(
+    outstandingCommissions.reduce((s, c) => s + Number(c.outstandingAmount || 0), 0)
+  );
+  const payableNow = roundCurrency(
+    payableCommissions.reduce((s, c) => s + getCommissionPayableAmount(c), 0)
+  );
+  const nextDeadline = outstandingCommissions
+    .map((c) => c.graceEndsAt)
+    .filter(Boolean)
+    .sort((a, b) => new Date(a) - new Date(b))[0] || null;
+
+  return {
+    accountStatus: refreshedState?.commissionAccountStatus || driver.commissionAccountStatus || 'active',
+    onboardingStatus: driver.status,
+    canReceiveRideRequests: Boolean(
+      driver.status === 'active' &&
+        (refreshedState?.commissionAccountStatus || driver.commissionAccountStatus || 'active') === 'active' &&
+        driver.online &&
+        (typeof refreshedState?.available === 'boolean' ? refreshedState.available : driver.available)
+    ),
+    currentWeek: {
+      weekStart,
+      weekEnd,
+      accruedAmount: roundCurrency(currentWeekCommission?.amount || 0),
+      paidAmount: roundCurrency(currentWeekCommission?.paidAmount || 0),
+      payableNow: roundCurrency(getCommissionPayableAmount(currentWeekCommission)),
+      rideCount: currentWeekCommission?.rideCount || 0,
+    },
+    payableNow,
+    outstanding: {
+      totalDue,
+      commissionCount: outstandingCommissions.length,
+      graceEndsAt: nextDeadline,
+      countdownMs: getCountdownMs(nextDeadline),
+      commissions: outstandingCommissions.map((c) => ({
+        id: c._id,
+        amount: c.amount,
+        dueAmount: c.dueAmount,
+        outstandingAmount: c.outstandingAmount,
+        weekStart: c.weekStart,
+        weekEnd: c.weekEnd,
+        status: c.status,
+      })),
+    },
+    lastPaymentDate: driver.lastPaymentDate || null,
+    latestTransaction: recentTransactions[0] || null,
+    recentTransactions,
+  };
 };
 
 module.exports = {
   calculateRideCommission,
-  canDriverReceiveRequests,
   getDriverCommissionSnapshot,
   handleCommissionPaymentCallback,
   initiateCommissionPayment,
@@ -869,5 +864,5 @@ module.exports = {
   restrictOverdueDrivers,
   runWeeklySettlement,
   sendGraceWarnings,
-  sendPaymentReminders
+  sendPaymentReminders,
 };

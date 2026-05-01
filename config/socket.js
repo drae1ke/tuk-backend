@@ -5,6 +5,11 @@ const Driver = require('../models/Driver');
 const User = require('../models/User');
 const { getDirections } = require('./ors');
 const { calculateRidePricing } = require('../utils/pricing');
+const {
+  getDriverCommissionSnapshot,
+  recordRideCommission,
+  refreshDriverCommissionState,
+} = require('../services/commissionService');
 
 let io;
 
@@ -116,7 +121,6 @@ const initializeSocket = (server) => {
           fare: pricing.fare,
           pricingBreakdown: pricing.breakdown,
           vehicleType: vehicleType || 'standard',
-          paymentMethod: data.paymentMethod || 'cash',
           status: 'pending',
           timeline: [{ status: 'pending', note: 'Ride requested via socket' }]
         });
@@ -125,6 +129,8 @@ const initializeSocket = (server) => {
         const nearbyDrivers = await Driver.find({
           online: true,
           available: true,
+          status: 'active',
+          commissionAccountStatus: 'active',
           'currentLocation': {
             $near: {
               $geometry: {
@@ -172,6 +178,15 @@ const initializeSocket = (server) => {
         if (!ride || ride.status !== 'pending') {
           return socket.emit('ride:error', { message: 'Ride not available' });
         }
+
+        await refreshDriverCommissionState(socket.userId);
+        const driver = await Driver.findById(socket.userId);
+        if (!driver || !driver.online || !driver.available) {
+          return socket.emit('ride:error', { message: 'You are not available for rides' });
+        }
+        if (driver.status !== 'active' || driver.commissionAccountStatus !== 'active') {
+          return socket.emit('ride:error', { message: 'Your account cannot accept new rides right now' });
+        }
         
         // Update ride with driver
         ride.driverId = socket.userId;
@@ -181,13 +196,9 @@ const initializeSocket = (server) => {
         await ride.save();
         
         // Update driver status
-        await Driver.findByIdAndUpdate(socket.userId, {
-          available: false,
-          currentRide: rideId
-        });
-        
-        // Get driver location
-        const driver = await Driver.findById(socket.userId);
+        driver.available = false;
+        driver.currentRide = rideId;
+        await driver.save();
         
         // Notify user
         io.to(`user:${ride.userId}`).emit('ride:accepted', {
@@ -258,13 +269,33 @@ const initializeSocket = (server) => {
         
         ride.status = 'completed';
         ride.completedAt = new Date();
+        ride.paymentStatus = 'pending';
+        ride.timeline.push({ status: 'completed', note: 'Ride completed' });
         await ride.save();
         
-        // Update driver availability
-        await Driver.findByIdAndUpdate(socket.userId, {
-          available: true,
-          currentRide: null
+        const driver = await Driver.findById(socket.userId);
+        if (driver) {
+          driver.available = true;
+          driver.currentRide = null;
+          driver.totalRides += 1;
+          driver.totalEarnings += ride.fare;
+          await driver.save();
+        }
+
+        await User.findByIdAndUpdate(ride.userId, {
+          $inc: { totalRides: 1, totalSpent: ride.fare },
         });
+
+        try {
+          await recordRideCommission(ride);
+          const commissionSummary = await getDriverCommissionSnapshot(socket.userId);
+          socket.emit('ride:completed-confirmation', {
+            rideId,
+            commission: commissionSummary,
+          });
+        } catch (error) {
+          console.error('Commission accrual failed after socket ride completion:', error);
+        }
         
         // Notify user
         io.to(`user:${ride.userId}`).emit('ride:completed', {

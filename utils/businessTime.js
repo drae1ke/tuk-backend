@@ -177,7 +177,7 @@ const getWeekRelativeDate = (weekStart, dayOffset, hour, minute, second = 0, mil
 };
 
 const getGraceDeadlineForWeek = (weekStart, timeZone = DEFAULT_TIMEZONE) => (
-  getWeekRelativeDate(weekStart, 8, 23, 59, 59, 999, timeZone)
+  getWeekRelativeDate(weekStart, 13, 23, 59, 59, 999, timeZone)
 );
 
 const formatTimestampForMpesa = (date = new Date(), timeZone = DEFAULT_TIMEZONE) => {

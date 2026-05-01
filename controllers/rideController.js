@@ -1,11 +1,11 @@
 const Ride = require('../models/Ride');
 const User = require('../models/User');
 const Driver = require('../models/Driver');
-const { getDirections, calculateFare } = require('../config/ors');
+const { getDirections } = require('../config/ors');
 const { getPricingConfig, calculateRidePricing } = require('../utils/pricing');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
-const { recordRideCommission } = require('../services/commissionService');
+const { recordRideCommission, refreshDriverCommissionState } = require('../services/commissionService');
 
 const mapRideSummary = (ride) => ({
   id: ride._id,
@@ -94,7 +94,7 @@ exports.estimateRide = catchAsync(async (req, res, next) => {
 
 // Request a ride
 exports.requestRide = catchAsync(async (req, res, next) => {
-  const { pickup, destination, vehicleType, paymentMethod } = req.body;
+  const { pickup, destination, vehicleType } = req.body;
   
   console.log('📝 Ride request received:', { pickup, destination });
   
@@ -130,7 +130,6 @@ exports.requestRide = catchAsync(async (req, res, next) => {
       fare: pricing.fare,
       pricingBreakdown: pricing.breakdown,
       vehicleType: vehicleType || 'standard',
-      paymentMethod: paymentMethod || 'cash',
       status: 'pending',
       timeline: [{ status: 'pending', note: 'Ride requested' }]
     });
@@ -169,7 +168,11 @@ exports.acceptRide = catchAsync(async (req, res, next) => {
     return next(new AppError('Ride is no longer available', 400));
   }
   
+  await refreshDriverCommissionState(req.user.id);
   const driver = await Driver.findById(req.user.id);
+  if (!driver) {
+    return next(new AppError('Driver not found', 404));
+  }
   if (!driver.online || !driver.available) {
     return next(new AppError('You are not available for rides', 400));
   }
@@ -417,7 +420,11 @@ exports.getCurrentDriverRide = catchAsync(async (req, res, next) => {
 
 // Get available rides for driver
 exports.getAvailableRides = catchAsync(async (req, res, next) => {
+  await refreshDriverCommissionState(req.user.id);
   const driver = await Driver.findById(req.user.id);
+  if (!driver) {
+    return next(new AppError('Driver not found', 404));
+  }
   
   if (!driver.online || !driver.available) {
     return next(new AppError('You must be online and available to see rides', 400));
@@ -506,7 +513,7 @@ exports.completeRide = catchAsync(async (req, res, next) => {
   
   ride.status = 'completed';
   ride.completedAt = new Date();
-  ride.paymentStatus = ride.paymentMethod === 'cash' ? 'pending' : 'paid';
+  ride.paymentStatus = 'pending';
   ride.timeline.push({ status: 'completed', note: 'Ride completed' });
   await ride.save();
   
@@ -521,10 +528,20 @@ exports.completeRide = catchAsync(async (req, res, next) => {
     $inc: { totalRides: 1, totalSpent: ride.fare }
   });
 
+// Record commission - this updates the weekly balance
   try {
-    await recordRideCommission(ride);
+    const commissionResult = await recordRideCommission(ride);
+    console.log('✅ Commission recorded:', {
+      rideId: ride._id,
+      driverId: ride.driverId,
+      fare: ride.fare,
+      commissionAmount: commissionResult?.commissionAmount,
+      weekStart: commissionResult?.weekStart,
+      skipped: commissionResult?.skipped,
+      reason: commissionResult?.reason
+    });
   } catch (error) {
-    console.error('Commission accrual failed after ride completion:', error);
+    console.error('❌ Commission accrual failed after ride completion:', error.message);
   }
   
   res.status(200).json({

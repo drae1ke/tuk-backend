@@ -1,13 +1,14 @@
 const Ride = require('../models/Ride');
 const Driver = require('../models/Driver');
-const { getDirections, calculateFare } = require('../config/ors');
+const { getDirections } = require('../config/ors');
+const { calculateRidePricing } = require('../utils/pricing');
 const { getDriverCommissionSnapshot, recordRideCommission } = require('../services/commissionService');
 
 module.exports = (io, socket) => {
   // User requests ride
   socket.on('ride:request', async (data) => {
     try {
-      const { pickup, destination, vehicleType, paymentMethod } = data;
+      const { pickup, destination, vehicleType } = data;
       
       // Calculate route and fare
       const route = await getDirections(
@@ -17,7 +18,12 @@ module.exports = (io, socket) => {
       
       const distance = route.distance / 1000;
       const duration = route.duration / 60;
-      const fare = calculateFare(distance);
+      const pricing = await calculateRidePricing({
+        distanceKm: distance,
+        durationMinutes: duration,
+        pickupAddress: pickup.address,
+        destinationAddress: destination.address,
+      });
       
       // Create ride
       const ride = await Ride.create({
@@ -34,9 +40,9 @@ module.exports = (io, socket) => {
         },
         distance,
         duration,
-        fare,
+        fare: pricing.fare,
+        pricingBreakdown: pricing.breakdown,
         vehicleType: vehicleType || 'standard',
-        paymentMethod: paymentMethod || 'cash',
         status: 'pending'
       });
       

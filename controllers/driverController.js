@@ -4,7 +4,7 @@ const { getIsochrones, reverseGeocode } = require('../config/ors');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
 const { calculateDistance } = require('../utils/geoUtils');
-const { getDriverCommissionSnapshot } = require('../services/commissionService');
+const { getDriverCommissionSnapshot, refreshDriverCommissionState } = require('../services/commissionService');
 
 // Get driver profile
 exports.getDriverProfile = catchAsync(async (req, res, next) => {
@@ -78,6 +78,7 @@ exports.updateLocation = catchAsync(async (req, res, next) => {
 // Update online status
 exports.updateOnlineStatus = catchAsync(async (req, res, next) => {
   const { online } = req.body;
+  await refreshDriverCommissionState(req.user.id);
   const driver = await Driver.findById(req.user.id);
 
   if (!driver) {
