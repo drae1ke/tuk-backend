@@ -2,9 +2,10 @@ const Ride = require('../models/Ride');
 const User = require('../models/User');
 const Driver = require('../models/Driver');
 const { getDirections, calculateFare } = require('../config/ors');
-const { calculateRidePricing } = require('../utils/pricing');
+const { getPricingConfig, calculateRidePricing } = require('../utils/pricing');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
+const { recordRideCommission } = require('../services/commissionService');
 
 const mapRideSummary = (ride) => ({
   id: ride._id,
@@ -43,6 +44,7 @@ exports.estimateRide = catchAsync(async (req, res, next) => {
       online: true,
       available: true,
       status: 'active',
+      commissionAccountStatus: 'active',
       currentLocation: {
         $near: {
           $geometry: {
@@ -171,6 +173,10 @@ exports.acceptRide = catchAsync(async (req, res, next) => {
   if (!driver.online || !driver.available) {
     return next(new AppError('You are not available for rides', 400));
   }
+
+  if (driver.status !== 'active' || driver.commissionAccountStatus !== 'active') {
+    return next(new AppError('Your account is restricted from receiving new rides', 403));
+  }
   
   ride.driverId = driver._id;
   ride.status = 'accepted';
@@ -245,11 +251,21 @@ exports.cancelRide = catchAsync(async (req, res, next) => {
   });
 });
 
+// Get pricing config for riders
+exports.getPricingConfig = catchAsync(async (req, res) => {
+  const pricing = await getPricingConfig();
+
+  res.status(200).json({
+    status: 'success',
+    data: { pricing }
+  });
+});
+
 // Rate ride
 exports.rateRide = catchAsync(async (req, res, next) => {
   const { rideId } = req.params;
   const { rating, feedback } = req.body;
-  
+
   const ride = await Ride.findById(rideId);
   if (!ride) {
     return next(new AppError('Ride not found', 404));
@@ -406,6 +422,10 @@ exports.getAvailableRides = catchAsync(async (req, res, next) => {
   if (!driver.online || !driver.available) {
     return next(new AppError('You must be online and available to see rides', 400));
   }
+
+  if (driver.status !== 'active' || driver.commissionAccountStatus !== 'active') {
+    return next(new AppError('Your account is restricted from receiving new ride requests', 403));
+  }
   
   const rides = await Ride.find({
     status: 'pending',
@@ -500,11 +520,22 @@ exports.completeRide = catchAsync(async (req, res, next) => {
   await User.findByIdAndUpdate(ride.userId, {
     $inc: { totalRides: 1, totalSpent: ride.fare }
   });
+
+  try {
+    await recordRideCommission(ride);
+  } catch (error) {
+    console.error('Commission accrual failed after ride completion:', error);
+  }
   
   res.status(200).json({
     status: 'success',
     data: { ride }
   });
+});
+
+exports.completeRideByBody = catchAsync(async (req, res, next) => {
+  req.params.rideId = req.body.rideId;
+  return exports.completeRide(req, res, next);
 });
 
 exports.getNearbyDriverPreview = catchAsync(async (req, res, next) => {
@@ -514,6 +545,7 @@ exports.getNearbyDriverPreview = catchAsync(async (req, res, next) => {
     online: true,
     available: true,
     status: 'active',
+    commissionAccountStatus: 'active',
     currentLocation: {
       $near: {
         $geometry: {

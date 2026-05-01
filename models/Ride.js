@@ -132,6 +132,17 @@ const rideSchema = new mongoose.Schema({
     max: 5
   },
   userFeedback: String,
+  commissionAmount: {
+    type: Number,
+    default: 0
+  },
+  commissionRate: {
+    type: Number,
+    default: 0
+  },
+  commissionWeekStart: Date,
+  commissionWeekEnd: Date,
+  commissionProcessedAt: Date,
   acceptedAt: Date,
   arrivedAt: Date,
   startedAt: Date,

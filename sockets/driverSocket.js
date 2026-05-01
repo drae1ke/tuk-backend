@@ -5,13 +5,20 @@ module.exports = (io, socket) => {
   // Driver goes online
   socket.on('driver:online', async (data) => {
     try {
+      const driver = await Driver.findById(socket.userId);
+      const canReceiveRequests = driver?.status === 'active' && driver?.commissionAccountStatus === 'active';
+
       await Driver.findByIdAndUpdate(socket.userId, {
         online: true,
-        available: true,
+        available: Boolean(canReceiveRequests && !driver?.currentRide),
         lastActive: new Date()
       });
       
-      socket.emit('driver:status', { online: true, available: true });
+      socket.emit('driver:status', {
+        online: true,
+        available: Boolean(canReceiveRequests && !driver?.currentRide),
+        commissionAccountStatus: driver?.commissionAccountStatus || 'active'
+      });
       console.log(`Driver ${socket.userId} is now online`);
     } catch (error) {
       console.error('Driver online error:', error);
@@ -37,6 +44,15 @@ module.exports = (io, socket) => {
   socket.on('driver:toggle-availability', async (data) => {
     try {
       const { available } = data;
+      const currentDriver = await Driver.findById(socket.userId);
+      if (currentDriver?.commissionAccountStatus !== 'active' || currentDriver?.status !== 'active') {
+        return socket.emit('driver:status', {
+          online: currentDriver?.online,
+          available: false,
+          commissionAccountStatus: currentDriver?.commissionAccountStatus || 'restricted'
+        });
+      }
+
       const driver = await Driver.findByIdAndUpdate(
         socket.userId,
         { available },

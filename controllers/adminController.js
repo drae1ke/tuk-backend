@@ -5,6 +5,7 @@ const PricingConfig = require('../models/PricingConfig');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
 const { DEFAULT_PRICING, invalidatePricingCache } = require('../utils/pricing');
+const { runWeeklySettlement } = require('../services/commissionService');
 
 exports.getDrivers = catchAsync(async (req, res) => {
   const drivers = await Driver.find().select('-password');
@@ -93,7 +94,7 @@ exports.getDashboardStats = catchAsync(async (req, res) => {
       { $group: { _id: null, total: { $sum: '$fare' } } }
     ]),
     Ride.countDocuments({ status: { $in: ['pending', 'accepted', 'arrived', 'started'] } }),
-    Driver.countDocuments({ online: true, status: 'active' })
+    Driver.countDocuments({ online: true, status: 'active', commissionAccountStatus: 'active' })
   ]);
 
   const recentRides = await Ride.find()
@@ -149,5 +150,18 @@ exports.updatePricing = catchAsync(async (req, res) => {
   res.status(200).json({
     status: 'success',
     data: { pricing }
+  });
+});
+
+exports.runWeeklySettlement = catchAsync(async (req, res) => {
+  const result = await runWeeklySettlement({
+    referenceDate: new Date(),
+    targetWeekStart: req.body?.weekStart || null,
+    triggeredBy: 'admin'
+  });
+
+  res.status(200).json({
+    status: 'success',
+    data: result
   });
 });

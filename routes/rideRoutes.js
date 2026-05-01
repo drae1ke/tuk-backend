@@ -13,6 +13,11 @@ router.post('/estimate',
   rideController.estimateRide
 );
 
+router.get('/pricing',
+  restrictUserType('user'),
+  rideController.getPricingConfig
+);
+
 // User routes
 router.get('/user/history', 
   restrictUserType('user'),
@@ -48,6 +53,11 @@ router.get('/driver/history',
 router.get('/driver/current', 
   restrictUserType('driver'),
   rideController.getCurrentDriverRide
+);
+
+router.post('/complete',
+  restrictUserType('driver'),
+  rideController.completeRideByBody
 );
 
 // Routes with rideId parameter

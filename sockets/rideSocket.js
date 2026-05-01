@@ -1,6 +1,7 @@
 const Ride = require('../models/Ride');
 const Driver = require('../models/Driver');
 const { getDirections, calculateFare } = require('../config/ors');
+const { getDriverCommissionSnapshot, recordRideCommission } = require('../services/commissionService');
 
 module.exports = (io, socket) => {
   // User requests ride
@@ -44,6 +45,7 @@ module.exports = (io, socket) => {
         online: true,
         available: true,
         status: 'active',
+        commissionAccountStatus: 'active',
         'currentLocation.coordinates': {
           $near: {
             $geometry: {
@@ -99,6 +101,9 @@ module.exports = (io, socket) => {
       await ride.save();
       
       const driver = await Driver.findById(socket.userId);
+      if (!driver || driver.status !== 'active' || driver.commissionAccountStatus !== 'active') {
+        return socket.emit('ride:error', { message: 'Your account cannot accept new rides right now' });
+      }
       driver.available = false;
       driver.currentRide = rideId;
       await driver.save();
@@ -200,6 +205,22 @@ module.exports = (io, socket) => {
       driver.totalRides += 1;
       driver.totalEarnings += ride.fare;
       await driver.save();
+
+      try {
+        await recordRideCommission(ride);
+      } catch (error) {
+        console.error('Commission accrual failed after socket ride completion:', error);
+      }
+
+      try {
+        const commissionSummary = await getDriverCommissionSnapshot(socket.userId);
+        socket.emit('ride:completed-confirmation', {
+          rideId,
+          commission: commissionSummary
+        });
+      } catch (error) {
+        console.error('Failed to emit commission summary after completion:', error);
+      }
       
       io.to(`user:${ride.userId}`).emit('ride:completed', {
         rideId,

@@ -4,6 +4,7 @@ const { getIsochrones, reverseGeocode } = require('../config/ors');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
 const { calculateDistance } = require('../utils/geoUtils');
+const { getDriverCommissionSnapshot } = require('../services/commissionService');
 
 // Get driver profile
 exports.getDriverProfile = catchAsync(async (req, res, next) => {
@@ -77,12 +78,19 @@ exports.updateLocation = catchAsync(async (req, res, next) => {
 // Update online status
 exports.updateOnlineStatus = catchAsync(async (req, res, next) => {
   const { online } = req.body;
+  const driver = await Driver.findById(req.user.id);
+
+  if (!driver) {
+    return next(new AppError('Driver not found', 404));
+  }
+
+  const canReceiveRequests = driver.status === 'active' && driver.commissionAccountStatus === 'active';
   
-  const driver = await Driver.findByIdAndUpdate(
+  const updatedDriver = await Driver.findByIdAndUpdate(
     req.user.id,
     { 
       online,
-      available: online,
+      available: online && canReceiveRequests && !driver.currentRide,
       lastActive: new Date()
     },
     { new: true }
@@ -90,7 +98,11 @@ exports.updateOnlineStatus = catchAsync(async (req, res, next) => {
   
   res.status(200).json({
     status: 'success',
-    data: { online: driver.online, available: driver.available }
+    data: {
+      online: updatedDriver.online,
+      available: updatedDriver.available,
+      commissionAccountStatus: updatedDriver.commissionAccountStatus
+    }
   });
 });
 
@@ -187,6 +199,8 @@ exports.getStats = catchAsync(async (req, res, next) => {
     data: {
       totalRides,
       totalEarnings: driver.totalEarnings,
+      weeklyCommissionBalance: driver.weeklyCommissionBalance,
+      outstandingCommissionBalance: driver.outstandingCommissionBalance,
       rating: avgRating,
       acceptanceRate,
       cancellationRate,
@@ -234,6 +248,7 @@ exports.getNearbyDrivers = catchAsync(async (req, res, next) => {
     online: true,
     available: true,
     status: 'active',
+    commissionAccountStatus: 'active',
     'currentLocation.coordinates': {
       $near: {
         $geometry: {
@@ -335,5 +350,30 @@ exports.updateMpesaNumber = catchAsync(async (req, res, next) => {
   res.status(200).json({
     status: 'success',
     data: { mpesaNumber: driver.mpesaNumber }
+  });
+});
+
+exports.getCommissionSummary = catchAsync(async (req, res) => {
+  const summary = await getDriverCommissionSnapshot(req.user.id);
+
+  res.status(200).json({
+    status: 'success',
+    data: summary
+  });
+});
+
+exports.getDriverStatus = catchAsync(async (req, res) => {
+  const summary = await getDriverCommissionSnapshot(req.user.id);
+
+  res.status(200).json({
+    status: 'success',
+    data: {
+      onboardingStatus: summary.onboardingStatus,
+      accountStatus: summary.accountStatus,
+      canReceiveRideRequests: summary.canReceiveRideRequests,
+      outstandingBalance: summary.outstanding.totalDue,
+      graceEndsAt: summary.outstanding.graceEndsAt,
+      lastPaymentDate: summary.lastPaymentDate
+    }
   });
 });

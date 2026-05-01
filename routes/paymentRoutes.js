@@ -5,9 +5,13 @@ const { protect } = require('../middleware/authMiddleware');
 
 // Public webhook (no auth)
 router.post('/mpesa-callback', paymentController.mpesaCallback);
+router.post('/callback', paymentController.commissionCallback);
 
 // Protected routes
 router.use(protect);
+
+router.post('/stkpush', paymentController.initiateCommissionStkPush);
+router.get('/commission/history', paymentController.getCommissionPaymentHistory);
 
 // Payment initiation
 router.post('/mpesa', paymentController.initiateMpesaPayment);

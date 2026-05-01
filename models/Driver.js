@@ -97,6 +97,24 @@ const driverSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  weeklyCommissionBalance: {
+    type: Number,
+    default: 0
+  },
+  outstandingCommissionBalance: {
+    type: Number,
+    default: 0
+  },
+  currentCommissionWeekStart: Date,
+  currentCommissionWeekEnd: Date,
+  commissionGraceEndsAt: Date,
+  lastPaymentDate: Date,
+  commissionAccountStatus: {
+    type: String,
+    enum: ['active', 'restricted'],
+    default: 'active'
+  },
+  restrictionReason: String,
   ratingCount: {
     type: Number,
     default: 0
@@ -152,6 +170,7 @@ const driverSchema = new mongoose.Schema({
 // Index for geospatial queries
 driverSchema.index({ currentLocation: '2dsphere' });
 driverSchema.index({ online: 1, available: 1, status: 1 });
+driverSchema.index({ status: 1, commissionAccountStatus: 1, online: 1, available: 1 });
 
 // Hash password
 driverSchema.pre('save', async function() {

@@ -7,6 +7,7 @@ router.use(protect);
 router.use(restrictTo('admin'));
 
 router.get('/dashboard', adminController.getDashboardStats);
+router.post('/run-weekly-settlement', adminController.runWeeklySettlement);
 router.get('/pricing', adminController.getPricing);
 router.patch('/pricing', adminController.updatePricing);
 router.get('/drivers', adminController.getDrivers);

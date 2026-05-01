@@ -10,6 +10,8 @@ router.use(restrictUserType('driver'));
 
 // Profile routes
 router.get('/profile', driverController.getDriverProfile);
+router.get('/commission', driverController.getCommissionSummary);
+router.get('/status', driverController.getDriverStatus);
 router.patch('/profile', driverController.updateDriverProfile);
 router.patch('/location', 
   validate(driverValidations.location),

@@ -12,6 +12,7 @@ dotenv.config();
 // Import configurations
 const { connectDB } = require('./config/database');
 const { initializeSocket } = require('./config/socket');
+const { startScheduler, stopScheduler } = require('./services/schedulerService');
 
 // Import middleware
 const { errorHandler } = require('./middleware/errorMiddleware');
@@ -64,6 +65,7 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/drivers', driverRoutes);
+app.use('/api/driver', driverRoutes);
 app.use('/api/rides', rideRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/admin', adminRoutes);
@@ -85,6 +87,7 @@ const PORT = process.env.PORT || 5000;
 const startServer = async () => {
   try {
     await connectDB();
+    startScheduler();
     console.log('✅ MongoDB connected successfully');
     
     server.listen(PORT, () => {
@@ -102,6 +105,7 @@ startServer();
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM signal received: closing HTTP server');
+  stopScheduler();
   server.close(() => {
     console.log('HTTP server closed');
     mongoose.connection.close(false, () => {

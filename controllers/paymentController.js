@@ -2,9 +2,12 @@ const Payment = require('../models/Payment');
 const Ride = require('../models/Ride');
 const User = require('../models/User');
 const Driver = require('../models/Driver');
+const PaymentTransaction = require('../models/PaymentTransaction');
 const { AppError } = require('../middleware/errorMiddleware');
 const catchAsync = require('../utils/catchAsync');
 const axios = require('axios');
+const { getDriverCommissionSnapshot, handleCommissionPaymentCallback, initiateCommissionPayment } = require('../services/commissionService');
+const { isCallbackAuthorized, parseStkPushCallback } = require('../services/mpesaService');
 
 // Initialize M-Pesa payment
 exports.initiateMpesaPayment = catchAsync(async (req, res, next) => {
@@ -96,6 +99,54 @@ exports.mpesaCallback = catchAsync(async (req, res, next) => {
   // Always respond with success to M-Pesa
   res.status(200).json({ ResultCode: 0, ResultDesc: 'Success' });
 });
+
+exports.initiateCommissionStkPush = catchAsync(async (req, res, next) => {
+  if (req.userType !== 'driver') {
+    return next(new AppError('Only drivers can pay commission through this endpoint', 403));
+  }
+
+  const { transaction, reused } = await initiateCommissionPayment({
+    driverId: req.user.id,
+    requestSource: 'driver',
+    idempotencyKey: req.headers['x-idempotency-key']
+  });
+  const summary = await getDriverCommissionSnapshot(req.user.id);
+
+  res.status(200).json({
+    status: 'success',
+    message: reused ? 'An STK Push is already pending for this commission balance' : 'Commission payment STK Push initiated',
+    data: {
+      transaction,
+      commission: summary
+    }
+  });
+});
+
+exports.commissionCallback = async (req, res) => {
+  if (!isCallbackAuthorized(req)) {
+    return res.status(403).json({
+      ResultCode: 1,
+      ResultDesc: 'Unauthorized callback'
+    });
+  }
+
+  try {
+    const callback = parseStkPushCallback(req.body);
+    await handleCommissionPaymentCallback(callback);
+
+    return res.status(200).json({
+      ResultCode: 0,
+      ResultDesc: 'Accepted'
+    });
+  } catch (error) {
+    console.error('Commission callback handling failed:', error);
+
+    return res.status(200).json({
+      ResultCode: 0,
+      ResultDesc: 'Accepted'
+    });
+  }
+};
 
 // Initialize M-Pesa STK Push (placeholder)
 const initiateMpesaSTKPush = async (phoneNumber, amount, paymentId) => {
@@ -230,5 +281,20 @@ exports.requestRefund = catchAsync(async (req, res, next) => {
     status: 'success',
     message: 'Refund requested successfully',
     data: { payment }
+  });
+});
+
+exports.getCommissionPaymentHistory = catchAsync(async (req, res, next) => {
+  if (req.userType !== 'driver') {
+    return next(new AppError('Only drivers can access commission payment history', 403));
+  }
+
+  const transactions = await PaymentTransaction.find({ driverId: req.user.id })
+    .sort('-createdAt')
+    .limit(20);
+
+  res.status(200).json({
+    status: 'success',
+    data: { transactions }
   });
 });
