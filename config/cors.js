@@ -9,7 +9,7 @@ const corsOptions = {
   origin: allowedOrigins.length ? allowedOrigins : '*',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id']
 };
 
 module.exports = { corsOptions, allowedOrigins };
