@@ -158,6 +158,8 @@ const driverSchema = new mongoose.Schema({
     enum: ['pending', 'active', 'suspended', 'rejected'],
     default: 'pending'
   },
+  resetPasswordToken: String,
+  resetPasswordExpire: Date,
   createdAt: {
     type: Date,
     default: Date.now

@@ -54,6 +54,48 @@ const createSendToken = async (req, user, statusCode, res, userType = 'user') =>
   });
 };
 
+const findAccountByEmail = async (email, { includePassword = false } = {}) => {
+  let userQuery = User.findOne({ email });
+  if (includePassword) userQuery = userQuery.select('+password');
+
+  const user = await userQuery;
+  if (user) {
+    return { account: user, userType: 'user' };
+  }
+
+  let driverQuery = Driver.findOne({ email });
+  if (includePassword) driverQuery = driverQuery.select('+password');
+
+  const driver = await driverQuery;
+  if (driver) {
+    return { account: driver, userType: 'driver' };
+  }
+
+  return { account: null, userType: null };
+};
+
+const findAccountByResetToken = async (hashedToken) => {
+  const user = await User.findOne({
+    resetPasswordToken: hashedToken,
+    resetPasswordExpire: { $gt: Date.now() }
+  });
+
+  if (user) {
+    return { account: user, userType: 'user' };
+  }
+
+  const driver = await Driver.findOne({
+    resetPasswordToken: hashedToken,
+    resetPasswordExpire: { $gt: Date.now() }
+  });
+
+  if (driver) {
+    return { account: driver, userType: 'driver' };
+  }
+
+  return { account: null, userType: null };
+};
+
 // Register new user
 exports.register = catchAsync(async (req, res, next) => {
   const { name, email, phone, password } = req.body;
@@ -85,19 +127,7 @@ exports.register = catchAsync(async (req, res, next) => {
   await createSendToken(req, user, 201, res);
 });
 
-const findAccountForLogin = async (email) => {
-  const user = await User.findOne({ email }).select('+password');
-  if (user) {
-    return { account: user, userType: 'user' };
-  }
-
-  const driver = await Driver.findOne({ email }).select('+password');
-  if (driver) {
-    return { account: driver, userType: 'driver' };
-  }
-
-  return { account: null, userType: null };
-};
+const findAccountForLogin = async (email) => findAccountByEmail(email, { includePassword: true });
 
 // Unified login for client, driver, and admin
 exports.login = catchAsync(async (req, res, next) => {
@@ -232,34 +262,37 @@ exports.updatePassword = catchAsync(async (req, res, next) => {
 
 // Forgot password
 exports.forgotPassword = catchAsync(async (req, res, next) => {
-  const { email } = req.body;
-  
-  const user = await User.findOne({ email });
-  if (!user) {
-    throw new AppError('No user found with that email', 404);
+  const normalizedEmail = req.body.email.toLowerCase().trim();
+
+  const { account } = await findAccountByEmail(normalizedEmail);
+  if (!account) {
+    return res.status(200).json({
+      status: 'success',
+      message: 'If an account exists for that email, a password reset link has been sent.'
+    });
   }
-  
+
   const resetToken = crypto.randomBytes(32).toString('hex');
-  user.resetPasswordToken = crypto
+  account.resetPasswordToken = crypto
     .createHash('sha256')
     .update(resetToken)
     .digest('hex');
-  user.resetPasswordExpire = Date.now() + 3600000; // 1 hour
-  
-  await user.save({ validateBeforeSave: false });
-  
+  account.resetPasswordExpire = Date.now() + 3600000; // 1 hour
+
+  await account.save({ validateBeforeSave: false });
+
   try {
-    await sendPasswordResetEmail(email, resetToken);
-    
+    await sendPasswordResetEmail(normalizedEmail, resetToken);
+
     res.status(200).json({
       status: 'success',
-      message: 'Password reset email sent'
+      message: 'If an account exists for that email, a password reset link has been sent.'
     });
   } catch (error) {
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpire = undefined;
-    await user.save({ validateBeforeSave: false });
-    
+    account.resetPasswordToken = undefined;
+    account.resetPasswordExpire = undefined;
+    await account.save({ validateBeforeSave: false });
+
     throw new AppError('Error sending email. Please try again later.', 500);
   }
 });
@@ -270,22 +303,22 @@ exports.resetPassword = catchAsync(async (req, res, next) => {
     .createHash('sha256')
     .update(req.params.token)
     .digest('hex');
-  
-  const user = await User.findOne({
-    resetPasswordToken: hashedToken,
-    resetPasswordExpire: { $gt: Date.now() }
-  });
-  
-  if (!user) {
+
+  const { account } = await findAccountByResetToken(hashedToken);
+
+  if (!account) {
     throw new AppError('Invalid or expired token', 400);
   }
-  
-  user.password = req.body.password;
-  user.resetPasswordToken = undefined;
-  user.resetPasswordExpire = undefined;
-  await user.save();
-  
-  await createSendToken(req, user, 200, res);
+
+  account.password = req.body.password;
+  account.resetPasswordToken = undefined;
+  account.resetPasswordExpire = undefined;
+  await account.save();
+
+  res.status(200).json({
+    status: 'success',
+    message: 'Password reset successful. You can now sign in with your new password.'
+  });
 });
 
 // Verify email

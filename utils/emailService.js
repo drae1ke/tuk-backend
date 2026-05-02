@@ -46,10 +46,12 @@ const sendPasswordResetEmail = async (email, token) => {
   const resetUrl = `${process.env.FRONTEND_URL}/reset-password/${token}`;
   
   const html = `
-    <h1>Password Reset Request</h1>
-    <p>Click the link below to reset your password:</p>
-    <a href="${resetUrl}">Reset Password</a>
+    <h1>TookRide Password Reset</h1>
+    <p>We received a request to reset your password.</p>
+    <p><a href="${resetUrl}">Reset Password</a></p>
     <p>This link will expire in 1 hour.</p>
+    <p>If the button does not open, use this link:</p>
+    <p>${resetUrl}</p>
     <p>If you didn't request this, please ignore this email.</p>
   `;
   

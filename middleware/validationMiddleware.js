@@ -32,6 +32,12 @@ const userValidations = {
     body('email').isEmail().withMessage('Please provide a valid email'),
     body('password').notEmpty().withMessage('Password is required')
   ],
+  forgotPassword: [
+    body('email').isEmail().withMessage('Please provide a valid email')
+  ],
+  resetPassword: [
+    body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+  ],
   updateProfile: [
     body('name').optional().isLength({ min: 2, max: 50 }),
     body('phone')

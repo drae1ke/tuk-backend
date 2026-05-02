@@ -11,8 +11,8 @@ router.post('/driver/register', authController.registerDriver);
 // Legacy alias for older clients. New clients should use /auth/login.
 router.post('/driver/login', authController.driverLogin);
 router.post('/refresh-token', authController.refreshToken);
-router.post('/forgot-password', authController.forgotPassword);
-router.post('/reset-password/:token', authController.resetPassword);
+router.post('/forgot-password', validate(userValidations.forgotPassword), authController.forgotPassword);
+router.post('/reset-password/:token', validate(userValidations.resetPassword), authController.resetPassword);
 router.post('/verify-email/:token', authController.verifyEmail);
 
 // Protected routes
