@@ -281,23 +281,24 @@ exports.forgotPassword = catchAsync(async (req, res, next) => {
 
   await account.save({ validateBeforeSave: false });
 
-let emailSent = false;
-try {
-  await sendPasswordResetEmail(normalizedEmail, resetToken);
-  emailSent = true;
-} catch (error) {
-  console.error('Password reset email failed:', error.message);
-  if (process.env.NODE_ENV !== 'production') {
-    console.log(`[DEV] Reset link: ${process.env.FRONTEND_URL}/reset-password/${resetToken}`);
+  let emailSent = false;
+  try {
+    await sendPasswordResetEmail(normalizedEmail, resetToken);
+    emailSent = true;
+  } catch (error) {
+    console.error('Password reset email failed:', error.message);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DEV] Reset link: ${process.env.FRONTEND_URL}/reset-password/${resetToken}`);
+    }
   }
-}
 
-res.status(200).json({
-  status: 'success',
-  message: 'If an account exists for that email, a password reset link has been sent.',
-  ...(process.env.NODE_ENV !== 'production' && !emailSent
-    ? { devNote: 'Email not configured. Check server logs for the reset link.' }
-    : {})
+  res.status(200).json({
+    status: 'success',
+    message: 'If an account exists for that email, a password reset link has been sent.',
+    ...(process.env.NODE_ENV !== 'production' && !emailSent
+      ? { devNote: 'Email not configured. Check server logs for the reset link.' }
+      : {})
+  });
 });
 
 // Reset password
