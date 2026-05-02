@@ -234,7 +234,7 @@ const recordRideCommission = async (rideRef) => {
         commissionProcessedAt: new Date(),
       },
     },
-    { new: true }
+    { returnDocument: 'after' }
   );
 
   const rideAlreadyMarkedProcessed = !updated;
@@ -280,7 +280,7 @@ const recordRideCommission = async (rideRef) => {
           },
         },
       },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' }
     );
   } catch (error) {
     if (!rideAlreadyMarkedProcessed) {
@@ -425,7 +425,7 @@ const runWeeklySettlement = async ({
     const commission = await Commission.findOneAndUpdate(
       { driverId: g.driverId, weekStart: targetWindow.weekStart },
       { $set: payload, $setOnInsert: { notifications: [] } },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' }
     );
 
     settledCommissions.push(commission);

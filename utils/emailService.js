@@ -1,17 +1,69 @@
+const dns = require('dns').promises;
+const net = require('net');
 const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST,
-  port: process.env.EMAIL_PORT,
-  secure: false,
-  auth: {
+/**
+ * Nodemailer picks a random A/AAAA address per connection; on networks without
+ * working IPv6 that often yields ENETUNREACH to Google/other SMTP. Prefer A
+ * record and keep TLS SNI on the real hostname when connecting by IPv4.
+ */
+let cachedTransporter = null;
+let cachedTransportConfigKey = '';
+
+const buildTransport = async () => {
+  const originalHost = process.env.EMAIL_HOST;
+  const port = Number(process.env.EMAIL_PORT) || 587;
+  const auth = {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
+  };
+
+  let host = originalHost;
+  if (
+    originalHost &&
+    !net.isIP(originalHost) &&
+    process.env.EMAIL_SMTP_USE_IPV6 !== 'true'
+  ) {
+    try {
+      const v4 = await dns.resolve4(originalHost);
+      if (v4.length) {
+        host = v4[0];
+      }
+    } catch {
+      // No A record or DNS error — let nodemailer resolve the hostname.
+    }
   }
-});
+
+  const connectByIp = host && net.isIP(host) && originalHost && !net.isIP(originalHost);
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: false,
+    auth,
+    ...(connectByIp ? { tls: { servername: originalHost } } : {})
+  });
+};
+
+const getTransporter = async () => {
+  const key = [
+    process.env.EMAIL_HOST,
+    process.env.EMAIL_PORT,
+    process.env.EMAIL_USER,
+    process.env.EMAIL_SMTP_USE_IPV6
+  ].join('|');
+
+  if (!cachedTransporter || cachedTransportConfigKey !== key) {
+    cachedTransporter = await buildTransport();
+    cachedTransportConfigKey = key;
+  }
+
+  return cachedTransporter;
+};
 
 const sendEmail = async (to, subject, html) => {
   try {
+    const transporter = await getTransporter();
     const info = await transporter.sendMail({
       from: `"TUKTUK-RIDE" <${process.env.EMAIL_USER}>`,
       to,

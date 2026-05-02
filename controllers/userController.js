@@ -47,7 +47,7 @@ exports.updateUserProfile = catchAsync(async (req, res, next) => {
   const user = await User.findByIdAndUpdate(
     req.user.id,
     filteredBody,
-    { new: true, runValidators: true }
+    { returnDocument: 'after', runValidators: true }
   );
   
   res.status(200).json({
@@ -115,7 +115,7 @@ exports.deleteSavedAddress = catchAsync(async (req, res, next) => {
   const user = await User.findByIdAndUpdate(
     req.user.id,
     { $pull: { savedAddresses: { _id: addressId } } },
-    { new: true }
+    { returnDocument: 'after' }
   );
   
   res.status(200).json({

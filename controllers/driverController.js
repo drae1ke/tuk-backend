@@ -44,7 +44,7 @@ exports.updateDriverProfile = catchAsync(async (req, res, next) => {
   const driver = await Driver.findByIdAndUpdate(
     req.user.id,
     filteredBody,
-    { new: true, runValidators: true }
+    { returnDocument: 'after', runValidators: true }
   );
   
   res.status(200).json({
@@ -66,7 +66,7 @@ exports.updateLocation = catchAsync(async (req, res, next) => {
       speed,
       accuracy
     },
-    { new: true }
+    { returnDocument: 'after' }
   );
   
   res.status(200).json({
@@ -94,7 +94,7 @@ exports.updateOnlineStatus = catchAsync(async (req, res, next) => {
       available: online && canReceiveRequests && !driver.currentRide,
       lastActive: new Date()
     },
-    { new: true }
+    { returnDocument: 'after' }
   );
   
   res.status(200).json({
@@ -121,7 +121,7 @@ exports.updateVehicle = catchAsync(async (req, res, next) => {
   const driver = await Driver.findByIdAndUpdate(
     req.user.id,
     vehicleUpdates,
-    { new: true, runValidators: true }
+    { returnDocument: 'after', runValidators: true }
   );
   
   res.status(200).json({
@@ -329,7 +329,7 @@ exports.updateBankDetails = catchAsync(async (req, res, next) => {
     {
       bankDetails: { bankName, accountNumber, accountName }
     },
-    { new: true, runValidators: true }
+    { returnDocument: 'after', runValidators: true }
   );
   
   res.status(200).json({
@@ -345,7 +345,7 @@ exports.updateMpesaNumber = catchAsync(async (req, res, next) => {
   const driver = await Driver.findByIdAndUpdate(
     req.user.id,
     { mpesaNumber },
-    { new: true }
+    { returnDocument: 'after' }
   );
   
   res.status(200).json({

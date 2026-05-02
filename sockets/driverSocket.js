@@ -56,7 +56,7 @@ module.exports = (io, socket) => {
       const driver = await Driver.findByIdAndUpdate(
         socket.userId,
         { available },
-        { new: true }
+        { returnDocument: 'after' }
       );
       
       io.to(`user:${socket.userId}`).emit('driver:availability-updated', {

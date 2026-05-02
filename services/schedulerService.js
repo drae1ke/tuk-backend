@@ -65,7 +65,7 @@ const _acquireJob = async ({ jobName, jobKey, scheduledFor }) => {
         ],
       },
       { $set: { status: 'running', startedAt: new Date(), error: null, result: null } },
-      { new: true }
+      { returnDocument: 'after' }
     );
   }
 };

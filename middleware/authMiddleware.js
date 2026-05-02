@@ -43,7 +43,7 @@ const protect = async (req, res, next) => {
       await Session.findOneAndUpdate(
         { sessionId: req.sessionId, accountId: decoded.id, accountType: decoded.userType, isActive: true },
         { lastSeenAt: new Date(), userAgent: req.headers['user-agent'], ipAddress: req.ip },
-        { new: true }
+        { returnDocument: 'after' }
       );
     }
     next();

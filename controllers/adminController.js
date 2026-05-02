@@ -40,7 +40,7 @@ exports.updateDriverStatus = catchAsync(async (req, res, next) => {
   const driver = await Driver.findByIdAndUpdate(
     req.params.id,
     { status },
-    { new: true, runValidators: true }
+    { returnDocument: 'after', runValidators: true }
   ).select('-password');
 
   if (!driver) {
@@ -69,7 +69,7 @@ exports.updateClientStatus = catchAsync(async (req, res, next) => {
   const client = await User.findOneAndUpdate(
     { _id: req.params.id, role: 'user' },
     { isActive },
-    { new: true, runValidators: true }
+    { returnDocument: 'after', runValidators: true }
   ).select('-password');
 
   if (!client) {
