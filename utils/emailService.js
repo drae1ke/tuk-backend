@@ -36,12 +36,30 @@ const buildTransport = async () => {
 
   const connectByIp = host && net.isIP(host) && originalHost && !net.isIP(originalHost);
 
+  // Determine if we should use SSL (port 465) or TLS (port 587)
+  const isSSL = port === 465;
+
   return nodemailer.createTransport({
     host,
     port,
-    secure: false,
+    secure: isSSL, // true for SSL (465), false for TLS (587)
     auth,
-    ...(connectByIp ? { tls: { servername: originalHost } } : {})
+    // Connection timeouts (in milliseconds)
+    connectionTimeout: 60000, // 60 seconds - connection to SMTP server
+    greetingTimeout: 30000,   // 30 seconds - wait for SMTP greeting
+    socketTimeout: 60000,     // 60 seconds - wait for data transfer
+    tls: {
+      // For Gmail, we need to allow less secure certificates in development
+      // but in production this should be omitted or set to true
+      rejectUnauthorized: process.env.NODE_ENV !== 'development',
+      ...(connectByIp ? { servername: originalHost } : {})
+    },
+    // Connection pool settings for better performance
+    pool: true,
+    maxConnections: 5,
+    maxMessages: 100,
+    rateDelta: 1000,    // Rate limit: delay between messages
+    rateLimit: 5        // Max messages per rateDelta
   });
 };
 
