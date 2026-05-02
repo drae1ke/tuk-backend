@@ -31,7 +31,7 @@ const app = express();
 const server = http.createServer(app);
 const io = socketio(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || '*',
+    origin: process.env.FRONTEND_URL || 'https://tuk-backend.onrender.com',
     methods: ['GET', 'POST'],
     credentials: true
   }
