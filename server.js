@@ -6,19 +6,16 @@ const helmet = require('helmet');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 
-// Load environment variables
 dotenv.config();
 
-// Import configurations
 const { connectDB } = require('./config/database');
 const { initializeSocket } = require('./config/socket');
 const { startScheduler, stopScheduler } = require('./services/schedulerService');
-
-// Import middleware
 const { errorHandler } = require('./middleware/errorMiddleware');
 const rateLimiter = require('./middleware/rateLimiter');
+const { corsOptions, allowedOrigins } = require('./config/cors'); // <-- import
 
-// Import routes
+// Routes
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const driverRoutes = require('./routes/driverRoutes');
@@ -26,33 +23,28 @@ const rideRoutes = require('./routes/rideRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 
-// Initialize express app
 const app = express();
 const server = http.createServer(app);
+
+// Socket.IO with same CORS origins
 const io = socketio(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || 'https://tuk-backend.onrender.com',
+    origin: allowedOrigins.length ? allowedOrigins : '*',
     methods: ['GET', 'POST'],
     credentials: true
   }
 });
 
-// Middleware - make sure all are functions
+// Apply CORS middleware using the config
 app.use(helmet());
-app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
-  credentials: true
-}));
+app.use(cors(corsOptions));               // <-- use from config
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Rate limiter middleware
 app.use(rateLimiter);
 
-// Initialize socket.io
 initializeSocket(io);
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
@@ -70,7 +62,7 @@ app.use('/api/rides', rideRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/admin', adminRoutes);
 
-// 404 handler for undefined routes
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({
     status: 'fail',
@@ -78,10 +70,9 @@ app.use((req, res) => {
   });
 });
 
-// Global error handler
 app.use(errorHandler);
 
-// Connect to database and start server
+// Start server
 const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {
@@ -92,7 +83,7 @@ const startServer = async () => {
     
     server.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
-      console.log(`📡 Socket.IO ready for real-time connections`);
+      console.log(`📡 Socket.IO ready with CORS origins: ${allowedOrigins.length ? allowedOrigins.join(', ') : '* (all)'}`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
