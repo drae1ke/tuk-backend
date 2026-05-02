@@ -121,8 +121,8 @@ exports.register = catchAsync(async (req, res, next) => {
     emailVerified: false
   });
   
-  // Send verification email
-  await sendVerificationEmail(email, emailVerificationToken);
+// Disable email verification notification during registration
+  // await sendVerificationEmail(email, emailVerificationToken);
   
   await createSendToken(req, user, 201, res);
 });
