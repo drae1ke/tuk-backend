@@ -502,95 +502,36 @@ exports.startRide = catchAsync(async (req, res, next) => {
 exports.completeRide = catchAsync(async (req, res, next) => {
   const { rideId } = req.params;
   
-  console.log('[DEBUG completeRide] Starting ride completion:', {
-    rideId,
-    userId: req.user.id,
-    timestamp: new Date().toISOString()
-  });
-  
   const ride = await Ride.findById(rideId);
   if (!ride || ride.driverId.toString() !== req.user.id) {
-    console.error('[DEBUG completeRide] Ride not found or not assigned:', { rideId, userId: req.user.id });
     return next(new AppError('Ride not found or not assigned to you', 404));
   }
   
   if (ride.status !== 'started') {
-    console.error('[DEBUG completeRide] Invalid status for completion:', { rideId, currentStatus: ride.status });
     return next(new AppError('Cannot complete ride now', 400));
   }
-  
-  console.log('[DEBUG completeRide] Ride found:', {
-    rideId: ride._id,
-    driverId: ride.driverId,
-    fare: ride.fare,
-    currentStatus: ride.status
-  });
   
   ride.status = 'completed';
   ride.completedAt = new Date();
   ride.paymentStatus = 'pending';
   ride.timeline.push({ status: 'completed', note: 'Ride completed' });
   
-  console.log('[DEBUG completeRide] Saving ride with status=completed:', {
-    rideId: ride._id,
-    newStatus: ride.status,
-    completedAt: ride.completedAt,
-    fare: ride.fare
-  });
-  
   await ride.save();
   
-  console.log('[DEBUG completeRide] Ride saved successfully');
-  
   const driver = await Driver.findById(req.user.id);
-  console.log('[DEBUG completeRide] Driver before earnings update:', {
-    driverId: driver._id,
-    currentTotalEarnings: driver.totalEarnings,
-    currentTotalRides: driver.totalRides
-  });
-  
   driver.available = true;
   driver.currentRide = null;
   driver.totalRides += 1;
   driver.totalEarnings += ride.fare;
-  
-  console.log('[DEBUG completeRide] Driver after earnings update:', {
-    driverId: driver._id,
-    newTotalEarnings: driver.totalEarnings,
-    newTotalRides: driver.totalRides,
-    fareAdded: ride.fare
-  });
-  
   await driver.save();
-  console.log('[DEBUG completeRide] Driver saved');
 
   await User.findByIdAndUpdate(ride.userId, {
     $inc: { totalRides: 1, totalSpent: ride.fare }
   });
-  console.log('[DEBUG completeRide] User updated');
-
-// Record commission - this updates the weekly balance
-  console.log('[DEBUG completeRide] About to record commission:', {
-    rideId: ride._id,
-    driverId: ride.driverId,
-    fare: ride.fare,
-    status: ride.status,
-    completedAt: ride.completedAt
-  });
+  // Record commission - this updates the weekly balance
   
   try {
-    const commissionResult = await recordRideCommission(ride);
-    console.log('✅ Commission recorded successfully:', {
-      rideId: ride._id,
-      driverId: ride.driverId,
-      fare: ride.fare,
-      commissionAmount: commissionResult?.commissionAmount,
-      weekStart: commissionResult?.weekStart,
-      weekEnd: commissionResult?.weekEnd,
-      skipped: commissionResult?.skipped,
-      reason: commissionResult?.reason,
-      timestamp: new Date().toISOString()
-    });
+    await recordRideCommission(ride);
   } catch (error) {
     console.error('❌ Commission accrual failed after ride completion:', {
       rideId: ride._id,

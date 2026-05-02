@@ -34,3 +34,4 @@
 {"level":"info","message":"Commission scheduler started","timestamp":"2026-05-01T20:40:01.113Z"}
 {"level":"info","message":{"driverId":"69d92d583457d43a650eba65","event":"commission.notification","subject":"TookRide: Commission payment could not be initiated","type":"payment_failure"},"timestamp":"2026-05-01T20:41:24.314Z"}
 {"level":"info","message":{"driverId":"69d92d583457d43a650eba65","event":"commission.notification","subject":"TookRide: Commission payment could not be initiated","type":"payment_failure"},"timestamp":"2026-05-01T20:47:03.428Z"}
+{"level":"info","message":"Commission scheduler started","timestamp":"2026-05-01T20:51:01.920Z"}

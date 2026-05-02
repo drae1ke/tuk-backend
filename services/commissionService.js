@@ -188,70 +188,35 @@ const refreshDriverCommissionState = async (driverId, { now = new Date() } = {})
  * Idempotent: uses commissionProcessedAt field to prevent double-counting.
  */
 const recordRideCommission = async (rideRef) => {
-  console.log('[Commission] recordRideCommission START:', {
-    input: rideRef?._id || rideRef,
-    timestamp: new Date().toISOString()
-  });
-  
   const rideId = rideRef?._id || rideRef;
   if (!rideId) {
-    console.log('[Commission] SKIPPED: no rideId provided', { reason: 'no-ride-id' });
     return { skipped: true, reason: 'no-ride-id' };
   }
 
   // Always re-read the persisted ride so commission accrual does not depend
   // on whether the caller passed a fresh or stale in-memory document.
-  console.log('[Commission] Fetching ride from DB:', { rideId });
   const ride = await Ride.findById(rideId).select(
     '_id driverId status fare completedAt commissionProcessedAt'
   );
 
-  console.log('[Commission] Ride fetched from DB:', {
-    rideId: ride?._id,
-    driverId: ride?.driverId,
-    status: ride?.status,
-    fare: ride?.fare,
-    completedAt: ride?.completedAt,
-    commissionProcessedAt: ride?.commissionProcessedAt,
-    rideFound: !!ride
-  });
-
   if (!ride) {
-    console.log('[Commission] SKIPPED: ride not found in database', { rideId });
     return { skipped: true, reason: 'ride-not-found' };
   }
   
   if (!ride?.driverId) {
-    console.log('[Commission] SKIPPED: no driverId on ride', { rideId, driverId: ride?.driverId });
     return { skipped: true, reason: 'no-driver-id' };
   }
   
   if (ride.status !== 'completed') {
-    console.log('[Commission] SKIPPED: ride not completed', { rideId, status: ride.status });
     return { skipped: true, reason: 'not-completed' };
   }
-  
-  console.log('[Commission] Ride validation passed, proceeding with accrual');
 
   const completedAt = ride.completedAt ? new Date(ride.completedAt) : new Date();
   const { weekStart, weekEnd } = getWeekWindow(completedAt, DEFAULT_TIMEZONE);
   const commissionAmount = calculateRideCommission(ride.fare);
   const grossFare = roundCurrency(ride.fare);
-  
-  console.log('[Commission] Calculated commission:', {
-    rideId: ride._id,
-    driverId: ride.driverId,
-    fare: ride.fare,
-    commissionRate: COMMISSION_RATE,
-    commissionAmount,
-    grossFare,
-    weekStart,
-    weekEnd,
-    timezone: DEFAULT_TIMEZONE
-  });
 
   // Atomic idempotency guard
-  console.log('[Commission] Updating ride with commission metadata...');
   const updated = await Ride.findOneAndUpdate(
     {
       _id: ride._id,
@@ -272,78 +237,61 @@ const recordRideCommission = async (rideRef) => {
     { new: true }
   );
 
-  if (!updated) {
-    console.log('[Commission] SKIPPED: ride already processed (idempotency check)', { rideId: ride._id });
-    return { skipped: true, reason: 'already-processed' };
-  }
-  
-  console.log('[Commission] Ride updated with commission info:', {
-    rideId: updated._id,
-    commissionAmount: updated.commissionAmount,
-    commissionProcessedAt: updated.commissionProcessedAt
-  });
+  const rideAlreadyMarkedProcessed = !updated;
+  if (rideAlreadyMarkedProcessed) {
+    const alreadyAccounted = await Commission.exists({
+      driverId: ride.driverId,
+      weekStart,
+      rideIds: ride._id,
+    });
 
-  // Upsert the commission bucket for this driver-week
-  console.log('[Commission] Upserting Commission record for driver-week:', {
-    driverId: ride.driverId,
-    weekStart,
-    weekEnd,
-    increment_amount: commissionAmount
-  });
-  
-  const commissionRecord = await Commission.findOneAndUpdate(
-    { driverId: ride.driverId, weekStart },
-    {
-      $setOnInsert: {
-        driverId: ride.driverId,
-        weekStart,
-        weekEnd,
-        amount: 0,
-        dueAmount: 0,
-        paidAmount: 0,
-        outstandingAmount: 0,
-        grossFares: 0,
-        rideCount: 0,
-        currency: 'KES',
-        status: 'accruing',
-        notifications: [],
-      },
-      $inc: { amount: commissionAmount, grossFares: grossFare, rideCount: 1 },
-      $addToSet: { rideIds: ride._id },
-      $push: {
-        lineItems: {
-          rideId: ride._id,
-          fare: grossFare,
-          commissionAmount,
-          completedAt,
+    // True duplicate call, safe no-op.
+    if (alreadyAccounted) {
+      return { skipped: true, reason: 'already-processed' };
+    }
+    // If ride was marked processed previously but never made it into Commission
+    // (e.g. earlier upsert failure), continue and repair the missing accrual.
+  }
+
+  let commissionRecord;
+  try {
+    commissionRecord = await Commission.findOneAndUpdate(
+      { driverId: ride.driverId, weekStart },
+      {
+        $setOnInsert: {
+          driverId: ride.driverId,
+          weekStart,
+          weekEnd,
+          dueAmount: 0,
+          paidAmount: 0,
+          outstandingAmount: 0,
+          currency: 'KES',
+          status: 'accruing',
+          notifications: [],
+        },
+        $inc: { amount: commissionAmount, grossFares: grossFare, rideCount: 1 },
+        $addToSet: { rideIds: ride._id },
+        $push: {
+          lineItems: {
+            rideId: ride._id,
+            fare: grossFare,
+            commissionAmount,
+            completedAt,
+          },
         },
       },
-    },
-    { upsert: true, new: true }
-  );
-  
-  console.log('[Commission] Commission record upserted:', {
-    commissionId: commissionRecord._id,
-    driverId: commissionRecord.driverId,
-    weekStart: commissionRecord.weekStart,
-    totalAmount: commissionRecord.amount,
-    rideCount: commissionRecord.rideCount,
-    grossFares: commissionRecord.grossFares,
-    status: commissionRecord.status
-  });
+      { upsert: true, new: true }
+    );
+  } catch (error) {
+    if (!rideAlreadyMarkedProcessed) {
+      await Ride.findByIdAndUpdate(ride._id, {
+        $set: { commissionProcessedAt: null },
+      });
+    }
+    throw error;
+  }
 
-  console.log('[Commission] Refreshing driver commission state for:', { driverId: ride.driverId });
   await refreshDriverCommissionState(ride.driverId, { now: completedAt });
-  console.log('[Commission] Driver commission state refreshed');
-
-  console.log('[Commission] ✅ recordRideCommission COMPLETED successfully:', {
-    rideId: ride._id,
-    driverId: ride.driverId,
-    commissionAmount,
-    weekStart,
-    weekEnd,
-    timestamp: new Date().toISOString()
-  });
   
   return { commissionAmount, weekStart, weekEnd };
 };
